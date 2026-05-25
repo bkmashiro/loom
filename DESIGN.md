@@ -327,6 +327,78 @@ WASM provides:
 
 ---
 
+## Performance Model
+
+### The Fundamental Bound
+
+Every agentic loop iteration costs:
+
+```
+iteration time = LLM inference time + Harness execution time
+```
+
+**Goal: Harness execution time < 10% of LLM inference time.**
+
+A typical LLM generates a 20-step plan in 2–5 seconds. The harness must complete those 20 steps in under 200ms. With parallel IO, this is achievable: 20 independent HTTP calls at 50ms each take 50ms total, not 1000ms.
+
+If the harness is fast enough, the LLM barely waits between thinking and acting — which means each inference call can include richer context (more completed results) and generate a larger, more comprehensive plan.
+
+### Pipelined Execution
+
+The ideal execution model overlaps LLM generation with Harness execution:
+
+```
+LLM output:    ──[step1]──[step2]──[step3]──[step4]──[done]──
+                    ↓         ↓         ↓         ↓
+Harness:       [exec1]   [exec2]   [exec3]   [exec4]
+               [running] [running] [running] [running]
+                                                      ↓
+                                             All results ready.
+                                             LLM starts next plan immediately.
+```
+
+By the time the LLM finishes generating the plan, most steps are already executing or complete. The LLM receives all results with near-zero additional wait.
+
+### What This Enables
+
+- **Larger plans per LLM call**: if execution is free, the LLM can generate 30-step plans as easily as 5-step ones
+- **Richer context per inference**: completed step results can be packed into the next prompt, giving the LLM more information per reasoning step
+- **Fewer total LLM calls**: more work per call means fewer round-trips to complete the overall task
+- **Result streaming back**: completed steps are appended to the next LLM context as they finish — no need to wait for the slowest step
+
+### Quantified Comparison
+
+| Scenario | Sequential tool calling | Loom |
+|---|---|---|
+| 10 steps, 50ms IO each | 10 × (2s LLM + 50ms) = 20.5s | 1 × (2s LLM + 50ms) = 2.05s |
+| 20 steps, 3 parallel stages | 20 × 2s = 40s | 3 × (2s + 50ms) ≈ 6.2s |
+| 5 independent steps | 5 × 2s = 10s | 1 × (2s + 50ms) = 2.05s |
+
+The gain is primarily from **reducing LLM round-trips**, with parallel IO execution as a secondary benefit.
+
+### Implementation Targets
+
+| Component | Target | Rationale |
+|---|---|---|
+| Per-step scheduling overhead | < 2ms | Goroutine spawn + DAG update |
+| WASM instance acquisition | < 1ms | Pre-warmed instance pool |
+| HTTP connection setup | ~0ms | Per-host connection pool, keep-alive |
+| Result delivery to next step | < 0.1ms | Zero-copy in-process pass |
+| Total harness overhead (20 steps) | < 50ms | Well under 10% of LLM inference |
+
+### Why WASM over Docker
+
+The performance model explains why isolation technology matters:
+
+| | Docker cold start | WASM cold start |
+|---|---|---|
+| Time | 500ms – 2s | 1 – 5ms |
+| Effect on harness | Destroys the performance model | Negligible |
+
+Docker cold start alone exceeds the entire harness execution budget. WASM is not just a security choice — it is a **correctness requirement** for the performance model to hold.
+
+---
+
 ## What Loom Is Not
 
 - Not a replacement for the LLM itself
