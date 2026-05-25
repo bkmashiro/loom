@@ -15,6 +15,7 @@ import (
 	"github.com/bkmashiro/loom/pkg/parser"
 	"github.com/bkmashiro/loom/pkg/pool"
 	"github.com/bkmashiro/loom/pkg/primitives"
+	"golang.org/x/sync/singleflight"
 )
 
 // Sentinel errors.
@@ -68,6 +69,7 @@ type StepExecutor struct {
 	httpClient *http.Client
 	tools      *ToolRegistry
 	kv         primitives.KVStore
+	sf         singleflight.Group
 }
 
 // Ensure interface is satisfied.
@@ -166,18 +168,22 @@ func interpolate(body string, inputs map[string]dag.Result) (string, error) {
 	return sb.String(), firstErr
 }
 
-// executeIO parses the first non-empty line as an HTTP request and executes it.
-// If retryable, retries on 5xx or network errors up to 3 times with exponential backoff.
-func (e *StepExecutor) executeIO(ctx context.Context, body string, retryable bool) (any, error) {
-	// Find first non-empty line.
-	line := ""
-	for _, l := range strings.Split(body, "\n") {
+// firstNonEmpty returns the first non-empty, trimmed line from s.
+func firstNonEmpty(s string) string {
+	for _, l := range strings.Split(s, "\n") {
 		l = strings.TrimSpace(l)
 		if l != "" {
-			line = l
-			break
+			return l
 		}
 	}
+	return ""
+}
+
+// executeIO parses the first non-empty line as an HTTP request and executes it.
+// If retryable, retries on 5xx or network errors up to 3 times with exponential backoff.
+// Identical concurrent requests (same method+url+body) are coalesced via singleflight.
+func (e *StepExecutor) executeIO(ctx context.Context, body string, retryable bool) (any, error) {
+	line := firstNonEmpty(body)
 	if line == "" {
 		return nil, fmt.Errorf("exec: IO step body is empty")
 	}
@@ -187,32 +193,38 @@ func (e *StepExecutor) executeIO(ctx context.Context, body string, retryable boo
 		return nil, fmt.Errorf("exec: parse HTTP request: %w", err)
 	}
 
-	if !retryable {
-		return e.doHTTP(ctx, req)
-	}
+	// Singleflight key: method + URL + body to coalesce identical concurrent requests.
+	key := req.Method + " " + req.URL + " " + req.Body
 
-	// Retry with exponential backoff: 100ms, 200ms, 400ms.
-	backoffs := []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
-	var lastErr error
-	for attempt := 0; attempt <= len(backoffs); attempt++ {
-		var result string
-		result, lastErr = e.doHTTP(ctx, req)
-		if lastErr == nil {
-			return result, nil
+	result, err, _ := e.sf.Do(key, func() (any, error) {
+		if !retryable {
+			return e.doHTTP(ctx, req)
 		}
-		// Check if it's a 5xx error wrapped in our sentinel.
-		if !isRetryable(lastErr) {
-			return nil, lastErr
-		}
-		if attempt < len(backoffs) {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoffs[attempt]):
+
+		// Retry with exponential backoff: 100ms, 200ms, 400ms.
+		backoffs := []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
+		var lastErr error
+		for attempt := 0; attempt <= len(backoffs); attempt++ {
+			var res string
+			res, lastErr = e.doHTTP(ctx, req)
+			if lastErr == nil {
+				return res, nil
+			}
+			// Check if it's a 5xx error wrapped in our sentinel.
+			if !isRetryable(lastErr) {
+				return nil, lastErr
+			}
+			if attempt < len(backoffs) {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(backoffs[attempt]):
+				}
 			}
 		}
-	}
-	return nil, lastErr
+		return nil, lastErr
+	})
+	return result, err
 }
 
 // retryableHTTPError is used to distinguish 5xx errors from other errors.

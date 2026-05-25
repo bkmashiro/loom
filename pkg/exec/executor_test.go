@@ -278,3 +278,62 @@ func TestExecuteUnknown(t *testing.T) {
 		t.Errorf("expected ErrUnknownPrimitive, got %v", err)
 	}
 }
+
+// --- Test 9: singleflight coalesces identical concurrent IO steps ---
+
+func TestSingleflight(t *testing.T) {
+	var callCount int32
+
+	// The server adds a small delay so concurrent requests overlap and singleflight can coalesce them.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		time.Sleep(30 * time.Millisecond)
+		fmt.Fprint(w, "coalesced-result")
+	}))
+	defer srv.Close()
+
+	url := srv.URL + "/data"
+	body := "GET " + url
+
+	// Build executor and scheduler with 3 independent identical IO steps.
+	e := makeExecutor(withClient(srv.Client()))
+	sched := dag.NewScheduler(context.Background(), e)
+
+	// Submit 3 steps with identical method+URL — no deps so they dispatch in parallel.
+	for i := 0; i < 3; i++ {
+		step := parser.Step{
+			ID:   fmt.Sprintf("io%d", i),
+			Type: parser.IO,
+			Body: body,
+		}
+		if err := sched.Submit(step); err != nil {
+			t.Fatalf("Submit step io%d: %v", i, err)
+		}
+	}
+	sched.Seal()
+
+	// Collect all results via Stream.
+	var results []dag.Result
+	for sr := range sched.Stream() {
+		results = append(results, sr.Result)
+	}
+
+	// All 3 steps should have succeeded.
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+	for _, r := range results {
+		if r.Err != nil {
+			t.Errorf("step %s errored: %v", r.StepID, r.Err)
+		}
+		if r.Data != "coalesced-result" {
+			t.Errorf("step %s: expected 'coalesced-result', got %v", r.StepID, r.Data)
+		}
+	}
+
+	// Singleflight should have resulted in only 1 actual HTTP call.
+	n := atomic.LoadInt32(&callCount)
+	if n != 1 {
+		t.Errorf("expected 1 HTTP call (singleflight coalescing), got %d", n)
+	}
+}
