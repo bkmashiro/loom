@@ -64,6 +64,7 @@ type Scheduler struct {
 	nodes     map[string]*node
 	completed int
 	pending   int // queued + running (decremented on complete/cancel)
+	sealed    bool
 
 	returnStepID string
 
@@ -361,8 +362,17 @@ func (s *Scheduler) Wait() (Result, error) {
 	return Result{}, nil
 }
 
+// Seal signals that no more steps will be submitted.
+// Stream() will close its channel only after Seal() is called and all pending steps complete.
+func (s *Scheduler) Seal() {
+	s.mu.Lock()
+	s.sealed = true
+	s.cond.Broadcast()
+	s.mu.Unlock()
+}
+
 // Stream returns a channel of StepResults emitted as each step completes.
-// Channel is closed when all steps are done or context cancelled.
+// Channel is closed when Seal() has been called and all steps are done, or context cancelled.
 func (s *Scheduler) Stream() <-chan StepResult {
 	ch := make(chan StepResult, 512)
 
@@ -370,17 +380,20 @@ func (s *Scheduler) Stream() <-chan StepResult {
 	s.streamSubs = append(s.streamSubs, ch)
 	s.streamMu.Unlock()
 
-	// Close the channel when all work is done or context cancelled
 	go func() {
 		defer close(ch)
-		done := make(chan struct{})
-		go func() {
-			s.wg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-s.ctx.Done():
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for {
+			if s.sealed && s.pending == 0 {
+				return
+			}
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+			}
+			s.cond.Wait()
 		}
 	}()
 

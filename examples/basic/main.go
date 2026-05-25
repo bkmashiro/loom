@@ -133,6 +133,9 @@ func main() {
 	exec := &mockExecutor{}
 	sched := dag.NewScheduler(ctx, exec)
 
+	// Subscribe to the stream before sealing so no results are missed.
+	stream := sched.Stream()
+
 	for _, step := range steps {
 		if err := sched.Submit(step); err != nil {
 			fmt.Printf("submit %q: %v\n", step.ID, err)
@@ -143,11 +146,10 @@ func main() {
 		sched.SetReturn(returnID)
 	}
 
-	// Phase 4: stream results as they complete.
-	// Stream() is called after all submits so wg > 0 and the channel stays
-	// open until all goroutines finish.
-	stream := sched.Stream()
+	// Seal signals no more steps are coming; Stream() will close after all complete.
+	sched.Seal()
 
+	// Phase 4: stream results as they complete.
 	for sr := range stream {
 		elapsed := time.Since(start)
 		if sr.Err != nil {

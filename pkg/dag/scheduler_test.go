@@ -418,6 +418,7 @@ func TestStream(t *testing.T) {
 	sched.Submit(step("A"))
 	sched.Submit(step("B"))
 	sched.Submit(step("C"))
+	sched.Seal()
 
 	seen := make(map[string]bool)
 	timeout := time.After(5 * time.Second)
@@ -432,9 +433,6 @@ func TestStream(t *testing.T) {
 				return
 			}
 			seen[sr.StepID] = true
-			if len(seen) == 3 {
-				sched.Cancel()
-			}
 		case <-timeout:
 			t.Fatalf("timeout waiting for stream results, seen: %v", seen)
 		}
