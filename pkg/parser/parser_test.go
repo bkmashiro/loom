@@ -396,6 +396,84 @@ func TestClose(t *testing.T) {
 	}
 }
 
+// TestParser_FuncDef: parses defun header → ID=name, Lang=params, Type=FuncDef
+func TestParser_FuncDef(t *testing.T) {
+	input := "```defun web_research(query, depth=2)\nbody\n```\n"
+	events, err := collectEvents(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	s := events[0].Step
+	if s == nil {
+		t.Fatal("expected Step event, got nil")
+	}
+	if s.Type != FuncDef {
+		t.Errorf("expected Type=FuncDef, got %v", s.Type)
+	}
+	if s.ID != "web_research" {
+		t.Errorf("expected ID=web_research, got %q", s.ID)
+	}
+	if s.Lang != "query, depth=2" {
+		t.Errorf("expected Lang=%q, got %q", "query, depth=2", s.Lang)
+	}
+	if s.Body != "body" {
+		t.Errorf("expected Body=body, got %q", s.Body)
+	}
+}
+
+// TestParser_FuncCall: parses call header with deps → Type=FuncCall, ID, Deps
+func TestParser_FuncCall(t *testing.T) {
+	input := "```call(dep1) my_call\nbody\n```\n"
+	events, err := collectEvents(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	s := events[0].Step
+	if s == nil {
+		t.Fatal("expected Step event, got nil")
+	}
+	if s.Type != FuncCall {
+		t.Errorf("expected Type=FuncCall, got %v", s.Type)
+	}
+	if s.ID != "my_call" {
+		t.Errorf("expected ID=my_call, got %q", s.ID)
+	}
+	if len(s.Deps) != 1 || s.Deps[0] != "dep1" {
+		t.Errorf("expected Deps=[dep1], got %v", s.Deps)
+	}
+}
+
+// TestParser_Agent: parses agent header with deps → Type=Agent, ID, Deps
+func TestParser_Agent(t *testing.T) {
+	input := "```agent(step1) reviewer\nbody\n```\n"
+	events, err := collectEvents(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	s := events[0].Step
+	if s == nil {
+		t.Fatal("expected Step event, got nil")
+	}
+	if s.Type != Agent {
+		t.Errorf("expected Type=Agent, got %v", s.Type)
+	}
+	if s.ID != "reviewer" {
+		t.Errorf("expected ID=reviewer, got %q", s.ID)
+	}
+	if len(s.Deps) != 1 || s.Deps[0] != "step1" {
+		t.Errorf("expected Deps=[step1], got %v", s.Deps)
+	}
+}
+
 // Benchmark: Parse 100-step plan
 func BenchmarkParse100Steps(b *testing.B) {
 	// Build a 100-step plan

@@ -21,10 +21,11 @@ import (
 
 // Sentinel errors.
 var (
-	ErrUnknownPrimitive = errors.New("exec: unknown primitive in step body")
-	ErrToolNotFound     = errors.New("exec: escape tool not found")
-	ErrMissingInput     = errors.New("exec: missing interpolation variable")
-	ErrNoPool           = errors.New("exec: WASM pool not configured")
+	ErrUnknownPrimitive  = errors.New("exec: unknown primitive in step body")
+	ErrToolNotFound      = errors.New("exec: escape tool not found")
+	ErrMissingInput      = errors.New("exec: missing interpolation variable")
+	ErrNoPool            = errors.New("exec: WASM pool not configured")
+	ErrNoAgentUpstream   = errors.New("exec: agent upstream not configured")
 )
 
 // ToolFunc is a callable registered tool.
@@ -58,24 +59,30 @@ func (r *ToolRegistry) Get(name string) (ToolFunc, bool) {
 
 // StepExecutorConfig holds configuration for StepExecutor.
 type StepExecutorConfig struct {
-	Pool        pool.Pool          // may be nil (WASM steps will fail if nil)
-	HTTPClient  *http.Client       // if nil, use http.DefaultClient
-	Tools       *ToolRegistry      // if nil, escape steps always return ErrToolNotFound
-	KV          primitives.KVStore // if nil, kv steps are not supported
-	IOCacheCap  int                // 0 = disabled
-	IOCacheTTL  time.Duration      // 0 = disabled
-	Sandbox     *sandbox.Sandbox   // if nil, FS steps return ErrNoSandbox
+	Pool          pool.Pool          // may be nil (WASM steps will fail if nil)
+	HTTPClient    *http.Client       // if nil, use http.DefaultClient
+	Tools         *ToolRegistry      // if nil, escape steps always return ErrToolNotFound
+	KV            primitives.KVStore // if nil, kv steps are not supported
+	IOCacheCap    int                // 0 = disabled
+	IOCacheTTL    time.Duration      // 0 = disabled
+	Sandbox       *sandbox.Sandbox   // if nil, FS steps return ErrNoSandbox
+	AgentUpstream string             // base URL for agent LLM calls, e.g. "https://api.openai.com"
+	AgentAPIKey   string             // auth key for agent calls
+	AgentModel    string             // default model if step body doesn't specify
 }
 
 // StepExecutor implements dag.Executor, routing each step by type.
 type StepExecutor struct {
-	pool       pool.Pool
-	httpClient *http.Client
-	tools      *ToolRegistry
-	kv         primitives.KVStore
-	sandbox    *sandbox.Sandbox
-	sf         singleflight.Group
-	cache      *IOCache // nil if caching disabled
+	pool          pool.Pool
+	httpClient    *http.Client
+	tools         *ToolRegistry
+	kv            primitives.KVStore
+	sandbox       *sandbox.Sandbox
+	sf            singleflight.Group
+	cache         *IOCache // nil if caching disabled
+	agentUpstream string
+	agentAPIKey   string
+	agentModel    string
 }
 
 // Ensure interface is satisfied.
@@ -88,11 +95,14 @@ func NewStepExecutor(cfg StepExecutorConfig) *StepExecutor {
 		client = http.DefaultClient
 	}
 	e := &StepExecutor{
-		pool:       cfg.Pool,
-		httpClient: client,
-		tools:      cfg.Tools,
-		kv:         cfg.KV,
-		sandbox:    cfg.Sandbox,
+		pool:          cfg.Pool,
+		httpClient:    client,
+		tools:         cfg.Tools,
+		kv:            cfg.KV,
+		sandbox:       cfg.Sandbox,
+		agentUpstream: cfg.AgentUpstream,
+		agentAPIKey:   cfg.AgentAPIKey,
+		agentModel:    cfg.AgentModel,
 	}
 	if cfg.IOCacheCap > 0 && cfg.IOCacheTTL > 0 {
 		e.cache = NewIOCache(cfg.IOCacheCap, cfg.IOCacheTTL)
@@ -155,6 +165,8 @@ func (e *StepExecutor) Execute(ctx context.Context, step parser.Step, inputs map
 		data = nil
 	case parser.Escape:
 		data, err = e.executeEscape(ctx, body, inputs)
+	case parser.Agent:
+		data, err = e.executeAgent(ctx, step, inputs)
 	default:
 		err = fmt.Errorf("%w: type=%d", ErrUnknownPrimitive, step.Type)
 	}
@@ -345,6 +357,10 @@ func (e *StepExecutor) executePure(ctx context.Context, step parser.Step, body s
 	case "js", "javascript":
 		return e.executeWASM(ctx, pool.LangJS, body, inputs)
 	default:
+		// Identity passthrough: body is a single step ID — return that dep's value.
+		if result, ok := inputs[body]; ok {
+			return result.Data, nil
+		}
 		// In-process placeholder: return body as-is.
 		return body, nil
 	}
@@ -378,6 +394,170 @@ func (e *StepExecutor) executeWASM(ctx context.Context, lang pool.Language, code
 	}
 
 	return inst.Run(ctx, code, rawInputs)
+}
+
+// agentRequest is the JSON body sent to the LLM chat completions endpoint.
+type agentRequest struct {
+	Model    string     `json:"model"`
+	Messages []agentMsg `json:"messages"`
+	Stream   bool       `json:"stream"`
+}
+
+// agentMsg is a single message in the chat completion request.
+type agentMsg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// agentResponse partially unmarshals the chat completion response.
+type agentResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
+// executeAgent parses the step body as a key:value agent spec and calls the LLM.
+func (e *StepExecutor) executeAgent(ctx context.Context, step parser.Step, inputs map[string]dag.Result) (any, error) {
+	if e.agentUpstream == "" {
+		return nil, ErrNoAgentUpstream
+	}
+
+	// Parse key: value lines from the step body.
+	// Keys: model, system, task. The task value may span multiple lines.
+	var model, system, task string
+	var currentKey string
+	var currentVal strings.Builder
+
+	flushCurrent := func() {
+		val := strings.TrimSpace(currentVal.String())
+		switch currentKey {
+		case "model":
+			model = val
+		case "system":
+			system = val
+		case "task":
+			task = val
+		}
+		currentKey = ""
+		currentVal.Reset()
+	}
+
+	for _, line := range strings.Split(step.Body, "\n") {
+		// Check if this line starts a new key.
+		if idx := strings.Index(line, ":"); idx > 0 {
+			key := strings.TrimSpace(line[:idx])
+			if key == "model" || key == "system" || key == "task" {
+				// Flush the previous key.
+				if currentKey != "" {
+					flushCurrent()
+				}
+				currentKey = key
+				currentVal.WriteString(strings.TrimSpace(line[idx+1:]))
+				continue
+			}
+		}
+		// Continuation line for the current key.
+		if currentKey != "" {
+			currentVal.WriteString("\n")
+			currentVal.WriteString(line)
+		}
+	}
+	flushCurrent()
+
+	// Apply default model if not overridden.
+	if model == "" {
+		model = e.agentModel
+	}
+
+	// Substitute ${dep_id} in task and system with fmt.Sprint(inputs[dep_id].Data).
+	subst := func(s string) string {
+		var sb strings.Builder
+		rest := s
+		for {
+			start := strings.Index(rest, "${")
+			if start == -1 {
+				sb.WriteString(rest)
+				break
+			}
+			sb.WriteString(rest[:start])
+			rest = rest[start+2:]
+			end := strings.Index(rest, "}")
+			if end == -1 {
+				sb.WriteString("${")
+				sb.WriteString(rest)
+				break
+			}
+			key := rest[:end]
+			rest = rest[end+1:]
+			if r, ok := inputs[key]; ok {
+				sb.WriteString(fmt.Sprint(r.Data))
+			} else {
+				sb.WriteString("${")
+				sb.WriteString(key)
+				sb.WriteString("}")
+			}
+		}
+		return sb.String()
+	}
+
+	task = subst(task)
+	system = subst(system)
+
+	// Build messages.
+	var messages []agentMsg
+	if system != "" {
+		messages = append(messages, agentMsg{Role: "system", Content: system})
+	}
+	messages = append(messages, agentMsg{Role: "user", Content: task})
+
+	reqBody := agentRequest{
+		Model:    model,
+		Messages: messages,
+		Stream:   false, // TODO: add streaming support
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("exec: marshal agent request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		e.agentUpstream+"/v1/chat/completions",
+		strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("exec: build agent HTTP request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if e.agentAPIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+e.agentAPIKey)
+	}
+
+	resp, err := e.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("exec: agent HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("exec: read agent response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("exec: agent upstream returned %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var agentResp agentResponse
+	if err := json.Unmarshal(respBytes, &agentResp); err != nil {
+		return nil, fmt.Errorf("exec: unmarshal agent response: %w", err)
+	}
+	if len(agentResp.Choices) == 0 {
+		return nil, fmt.Errorf("exec: agent response has no choices")
+	}
+
+	return agentResp.Choices[0].Message.Content, nil
 }
 
 // executeEscape dispatches a "@tool <name> <json-args>" step to a registered tool.

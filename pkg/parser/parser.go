@@ -13,12 +13,15 @@ import (
 type StepType int
 
 const (
-	IO     StepType = iota // 0 — Idempotent read
-	Write                  // 1 — Side-effecting write
-	Pure                   // 2 — Deterministic computation
-	Shell                  // 3 — Shell command in WASM sandbox
-	Async                  // 4 — Fire-and-forget
-	Escape                 // 5 — Raw tool call
+	IO      StepType = iota // 0 — Idempotent read
+	Write                   // 1 — Side-effecting write
+	Pure                    // 2 — Deterministic computation
+	Shell                   // 3 — Shell command in WASM sandbox
+	Async                   // 4 — Fire-and-forget
+	Escape                  // 5 — Raw tool call
+	FuncDef                 // 6 — function definition (defun)
+	FuncCall                // 7 — function invocation (call)
+	Agent                   // 8 — sub-agent delegation
 )
 
 // Step represents a parsed code fence block.
@@ -222,6 +225,9 @@ var stepTypeMap = map[string]StepType{
 	"shell":  Shell,
 	"async":  Async,
 	"escape": Escape,
+	"defun":  FuncDef,
+	"call":   FuncCall,
+	"agent":  Agent,
 }
 
 // parseFenceHeader parses the text after the opening ```.
@@ -252,6 +258,31 @@ func parseFenceHeader(header string, asyncCounter int) (*Step, bool) {
 	stepType, ok := stepTypeMap[keyword]
 	if !ok {
 		return nil, true
+	}
+
+	// FuncDef (defun) has special syntax: defun name(param1, param2)
+	// The function name goes into ID, params string goes into Lang.
+	if stepType == FuncDef {
+		rest = strings.TrimSpace(rest)
+		// rest should be: "name(param1, param2)" or just "name"
+		parenIdx := strings.Index(rest, "(")
+		var funcName, params string
+		if parenIdx == -1 {
+			funcName = strings.TrimSpace(rest)
+		} else {
+			funcName = strings.TrimSpace(rest[:parenIdx])
+			closeIdx := strings.Index(rest[parenIdx:], ")")
+			if closeIdx == -1 {
+				return nil, true
+			}
+			params = rest[parenIdx+1 : parenIdx+closeIdx]
+		}
+		return &Step{
+			ID:   funcName,
+			Type: FuncDef,
+			Deps: []string{},
+			Lang: params,
+		}, false
 	}
 
 	// Now parse rest for: optional deps in parens and optional ID
