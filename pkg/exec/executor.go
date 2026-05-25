@@ -15,6 +15,7 @@ import (
 	"github.com/bkmashiro/loom/pkg/parser"
 	"github.com/bkmashiro/loom/pkg/pool"
 	"github.com/bkmashiro/loom/pkg/primitives"
+	"github.com/bkmashiro/loom/pkg/sandbox"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -63,6 +64,7 @@ type StepExecutorConfig struct {
 	KV          primitives.KVStore // if nil, kv steps are not supported
 	IOCacheCap  int                // 0 = disabled
 	IOCacheTTL  time.Duration      // 0 = disabled
+	Sandbox     *sandbox.Sandbox   // if nil, FS steps return ErrNoSandbox
 }
 
 // StepExecutor implements dag.Executor, routing each step by type.
@@ -71,6 +73,7 @@ type StepExecutor struct {
 	httpClient *http.Client
 	tools      *ToolRegistry
 	kv         primitives.KVStore
+	sandbox    *sandbox.Sandbox
 	sf         singleflight.Group
 	cache      *IOCache // nil if caching disabled
 }
@@ -89,11 +92,38 @@ func NewStepExecutor(cfg StepExecutorConfig) *StepExecutor {
 		httpClient: client,
 		tools:      cfg.Tools,
 		kv:         cfg.KV,
+		sandbox:    cfg.Sandbox,
 	}
 	if cfg.IOCacheCap > 0 && cfg.IOCacheTTL > 0 {
 		e.cache = NewIOCache(cfg.IOCacheCap, cfg.IOCacheTTL)
 	}
 	return e
+}
+
+// fsOps lists the lowercase operation keywords recognized as FS commands.
+var fsOps = map[string]bool{
+	"read": true, "cat": true, "write": true, "append": true, "ls": true,
+}
+
+// looksLikeFSCommand returns true when the first word of body is a known FS op.
+func looksLikeFSCommand(body string) bool {
+	fields := strings.Fields(body)
+	if len(fields) == 0 {
+		return false
+	}
+	return fsOps[strings.ToLower(fields[0])]
+}
+
+// executeFS parses body as an FSCommand and runs it against e.sandbox.
+func (e *StepExecutor) executeFS(ctx context.Context, body string) (any, error) {
+	if e.sandbox == nil {
+		return nil, sandbox.ErrNoSandbox
+	}
+	cmd, err := primitives.ParseFSCommand(body)
+	if err != nil {
+		return nil, err
+	}
+	return primitives.ExecuteFS(ctx, cmd, e.sandbox)
 }
 
 // Execute runs a single step, routing by StepType.
@@ -109,7 +139,12 @@ func (e *StepExecutor) Execute(ctx context.Context, step parser.Step, inputs map
 	case parser.IO:
 		data, err = e.executeIO(ctx, body, true) // retryable
 	case parser.Write:
-		data, err = e.executeIO(ctx, body, false) // not retryable
+		firstLine := strings.SplitN(strings.TrimSpace(body), "\n", 2)[0]
+		if looksLikeFSCommand(firstLine) {
+			data, err = e.executeFS(ctx, body)
+		} else {
+			data, err = e.executeIO(ctx, body, false) // not retryable
+		}
 	case parser.Pure:
 		data, err = e.executePure(ctx, step, body, inputs)
 	case parser.Shell:
@@ -320,7 +355,18 @@ func (e *StepExecutor) executeWASM(ctx context.Context, lang pool.Language, code
 	if e.pool == nil {
 		return nil, ErrNoPool
 	}
-	inst, err := e.pool.Acquire(ctx, lang)
+
+	var inst pool.Instance
+	var err error
+	if e.sandbox != nil {
+		fsys, fsErr := e.sandbox.FS("/")
+		if fsErr != nil {
+			return nil, fmt.Errorf("exec: sandbox FS: %w", fsErr)
+		}
+		inst, err = e.pool.AcquireWithFS(ctx, lang, fsys)
+	} else {
+		inst, err = e.pool.Acquire(ctx, lang)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("exec: acquire WASM instance: %w", err)
 	}

@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,7 +19,33 @@ import (
 func main() {
 	cfg := proxy.ConfigFromEnv()
 
-	// CLI flags override env vars
+	// Pre-scan os.Args for --config / -config so we can load the file before
+	// binding flags. This ensures merge priority: env > file > flag default,
+	// with explicit flag values winning at parse time.
+	configPath := ""
+	args := os.Args[1:]
+	for i, arg := range args {
+		if arg == "--config" || arg == "-config" {
+			if i+1 < len(args) {
+				configPath = args[i+1]
+			}
+		} else if strings.HasPrefix(arg, "--config=") {
+			configPath = strings.TrimPrefix(arg, "--config=")
+		} else if strings.HasPrefix(arg, "-config=") {
+			configPath = strings.TrimPrefix(arg, "-config=")
+		}
+	}
+	if configPath != "" {
+		if err := proxy.LoadConfigFile(configPath, &cfg); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Error("failed to load config file", "path", configPath, "err", err)
+			os.Exit(1)
+		}
+	}
+
+	// CLI flags override env vars and config file. Bind with cfg values (which
+	// may already include file values) as defaults so unprovided flags retain
+	// env/file values.
+	flag.String("config", "", "Path to JSON config file (merged under env vars; flags override)")
 	flag.StringVar(&cfg.Addr, "addr", cfg.Addr, "Listen address")
 	flag.StringVar(&cfg.Upstream, "upstream", cfg.Upstream, "Upstream LLM API base URL")
 	flag.StringVar(&cfg.APIKey, "api-key", cfg.APIKey, "Override auth for upstream calls")

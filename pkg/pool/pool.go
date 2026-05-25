@@ -7,6 +7,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"time"
 )
 
@@ -45,6 +46,12 @@ type Pool interface {
 	// Acquire waits for an idle instance for the given language. Returns
 	// ErrLanguageNotSupported or ErrPoolTimeout on failure.
 	Acquire(ctx context.Context, lang Language) (Instance, error)
+
+	// AcquireWithFS instantiates a fresh WASM module with fsys mounted at the
+	// guest root ("/"). Slower than Acquire (bypasses pre-warm pool) but provides
+	// per-execution FS isolation. The caller must call Release(instance) when done.
+	// If fsys is nil, falls back to Acquire.
+	AcquireWithFS(ctx context.Context, lang Language, fsys fs.FS) (Instance, error)
 
 	// Release restores the instance's snapshot state and returns it to the pool.
 	Release(inst Instance)

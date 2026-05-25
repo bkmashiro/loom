@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bkmashiro/loom/pkg/loom"
+	"github.com/bkmashiro/loom/pkg/sandbox"
 )
 
 // buildPlan is a helper to create an io.Reader from a plan string.
@@ -385,5 +386,67 @@ return tool_step
 	}
 	if result.Data != "x=1" {
 		t.Errorf("expected result 'x=1', got %v", result.Data)
+	}
+}
+
+// TestLoom_WithSandbox_EphemeralRoundTrip: write a file then read it back via sandbox.
+func TestLoom_WithSandbox_EphemeralRoundTrip(t *testing.T) {
+	// Plan: write step writes a file; io step (disambiguated to FS) reads it back.
+	// We need to read from the same sandbox instance, so we'll write and then verify
+	// using the executor — but through loom we cannot directly inspect the sandbox.
+	// Instead, run a plan where a write step writes and a separate write step reads.
+	// Since FS read returns []byte but Loom's return expects the last step result,
+	// we run the write, then read back and return.
+	plan := `
+` + "```" + `write writeStep
+write /hello.txt world
+` + "```" + `
+
+` + "```" + `write(writeStep) readStep
+read /hello.txt
+` + "```" + `
+
+return readStep
+`
+
+	l := loom.New(loom.WithSandbox(sandbox.EphemeralSandbox()))
+	result, err := l.Run(context.Background(), planReader(plan))
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if result.StepID != "readStep" {
+		t.Errorf("expected StepID=readStep, got %q", result.StepID)
+	}
+	data, ok := result.Data.([]byte)
+	if !ok {
+		t.Fatalf("expected []byte from read step, got %T: %v", result.Data, result.Data)
+	}
+	if string(data) != "world" {
+		t.Errorf("expected 'world', got %q", string(data))
+	}
+}
+
+// TestLoom_NoSandbox_Default: running without WithSandbox executes normally without errors.
+func TestLoom_NoSandbox_Default(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	plan := fmt.Sprintf(`
+`+"```"+`io fetchStep
+GET %s
+`+"```"+`
+
+return fetchStep
+`, srv.URL)
+
+	l := loom.New(WithTestHTTPClient(srv)) // no WithSandbox
+	result, err := l.Run(context.Background(), planReader(plan))
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if result.Data != "ok" {
+		t.Errorf("expected 'ok', got %v", result.Data)
 	}
 }

@@ -1,0 +1,16 @@
+{
+  "upstream": "https://api.openai.com",
+  "addr": ":8080",
+  "log_level": "info",
+  "session_ttl": "30m",
+  "timeout": "120s",
+  "injection_role": "tool",
+  "plan_visibility": "suppress",
+  "sandbox": {
+    "mounts": [
+      {"guest": "/data", "host": "/mnt/datasets", "mode": "ro"},
+      {"guest": "/work", "host": "/mnt/workdir",  "mode": "rw"},
+      {"guest": "/tmp",                            "mode": "ephemeral"}
+    ]
+  }
+}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/bkmashiro/loom/pkg/dag"
 	"github.com/bkmashiro/loom/pkg/parser"
+	"github.com/bkmashiro/loom/pkg/sandbox"
 )
 
 // --- Helpers ---
@@ -37,6 +38,20 @@ func withClient(c *http.Client) func(*StepExecutorConfig) {
 
 func withTools(r *ToolRegistry) func(*StepExecutorConfig) {
 	return func(cfg *StepExecutorConfig) { cfg.Tools = r }
+}
+
+func withSandbox(sb *sandbox.Sandbox) func(*StepExecutorConfig) {
+	return func(cfg *StepExecutorConfig) { cfg.Sandbox = sb }
+}
+
+func mustSandbox(t *testing.T, cfg sandbox.Config) *sandbox.Sandbox {
+	t.Helper()
+	sb, err := sandbox.New(cfg)
+	if err != nil {
+		t.Fatalf("sandbox.New: %v", err)
+	}
+	t.Cleanup(func() { sb.Close() })
+	return sb
 }
 
 // --- Test 1: interpolate ---
@@ -430,5 +445,130 @@ func TestExecutor_WriteNotCached(t *testing.T) {
 	n := atomic.LoadInt32(&callCount)
 	if n != 2 {
 		t.Errorf("expected 2 HTTP calls for Write steps (no cache), got %d", n)
+	}
+}
+
+// --- Test 12: FS write via write step with ephemeral sandbox ---
+
+func TestExecutor_FSWrite_Ephemeral(t *testing.T) {
+	sb := mustSandbox(t, sandbox.EphemeralSandbox())
+	e := makeExecutor(withSandbox(sb))
+
+	step := parser.Step{
+		ID:   "fswrite",
+		Type: parser.Write,
+		Body: "write /tmp/out.txt hello",
+	}
+
+	res, err := e.Execute(context.Background(), step, nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.Data != nil {
+		t.Errorf("expected nil data for write, got %v", res.Data)
+	}
+
+	got, err := sb.ReadFile("/tmp/out.txt")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("expected 'hello', got %q", string(got))
+	}
+}
+
+// --- Test 13: FS read via io step with pre-populated ephemeral sandbox ---
+
+func TestExecutor_FSRead_Ephemeral(t *testing.T) {
+	sb := mustSandbox(t, sandbox.EphemeralSandbox())
+	if err := sb.WriteFile("/tmp/data.txt", []byte("file-content"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	e := makeExecutor(withSandbox(sb))
+
+	// Use a write step (disambiguated to FS because body starts with "read").
+	step := parser.Step{
+		ID:   "fsread",
+		Type: parser.Write,
+		Body: "read /tmp/data.txt",
+	}
+
+	res, err := e.Execute(context.Background(), step, nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	data, ok := res.Data.([]byte)
+	if !ok {
+		t.Fatalf("expected []byte data, got %T: %v", res.Data, res.Data)
+	}
+	if string(data) != "file-content" {
+		t.Errorf("expected 'file-content', got %q", string(data))
+	}
+}
+
+// --- Test 14: FS write with nil sandbox returns ErrNoSandbox ---
+
+func TestExecutor_FSWrite_NoSandbox(t *testing.T) {
+	e := makeExecutor() // no sandbox
+
+	step := parser.Step{
+		ID:   "fswrite",
+		Type: parser.Write,
+		Body: "write /tmp/out.txt hello",
+	}
+
+	_, err := e.Execute(context.Background(), step, nil)
+	if !errors.Is(err, sandbox.ErrNoSandbox) {
+		t.Errorf("expected ErrNoSandbox, got %v", err)
+	}
+}
+
+// --- Test 15: FS write against read-only sandbox returns ErrReadOnly ---
+
+func TestExecutor_FSWrite_ReadOnly(t *testing.T) {
+	// Use a temp dir to back the read-only mount.
+	t.TempDir() // ensure temp infra is set up
+	sb := mustSandbox(t, sandbox.ReadOnlySandbox(t.TempDir()))
+	e := makeExecutor(withSandbox(sb))
+
+	step := parser.Step{
+		ID:   "fswrite",
+		Type: parser.Write,
+		Body: "write /out.txt hello",
+	}
+
+	_, err := e.Execute(context.Background(), step, nil)
+	if !errors.Is(err, sandbox.ErrReadOnly) {
+		t.Errorf("expected ErrReadOnly, got %v", err)
+	}
+}
+
+// --- Test 16: HTTP write step still routes to HTTP (regression) ---
+
+func TestExecutor_HTTP_StillWorks(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		fmt.Fprint(w, "posted")
+	}))
+	defer srv.Close()
+
+	e := makeExecutor(withClient(srv.Client()))
+
+	step := parser.Step{
+		ID:   "httpwrite",
+		Type: parser.Write,
+		Body: "POST " + srv.URL + "/data",
+	}
+
+	res, err := e.Execute(context.Background(), step, nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.Data != "posted" {
+		t.Errorf("expected 'posted', got %v", res.Data)
 	}
 }

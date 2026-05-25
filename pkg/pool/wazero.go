@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"runtime"
@@ -158,11 +159,68 @@ func (p *wazeroPool) Acquire(ctx context.Context, lang Language) (Instance, erro
 	}
 }
 
+// AcquireWithFS instantiates a fresh WASM module with fsys mounted at the
+// guest root ("/"). If fsys is nil, it delegates to Acquire.
+func (p *wazeroPool) AcquireWithFS(ctx context.Context, lang Language, fsys fs.FS) (Instance, error) {
+	if fsys == nil {
+		return p.Acquire(ctx, lang)
+	}
+
+	p.mu.RLock()
+	compiled, ok := p.compiled[lang]
+	p.mu.RUnlock()
+
+	if !ok {
+		return nil, ErrLanguageNotSupported
+	}
+
+	fsConfig := wazero.NewFSConfig().WithFSMount(fsys, "/")
+	modCfg := wazero.NewModuleConfig().
+		WithName("").
+		WithFSConfig(fsConfig).
+		WithSysNanosleep().
+		WithSysWalltime().
+		WithSysNanotime().
+		WithStartFunctions("_initialize", "_start")
+
+	mod, err := p.rt.InstantiateModule(ctx, compiled, modCfg)
+	if err != nil {
+		return nil, fmt.Errorf("pool: AcquireWithFS instantiate: %w", err)
+	}
+
+	inst := &wasmInstance{
+		lang:      lang,
+		mod:       mod,
+		allocFn:   mod.ExportedFunction("alloc"),
+		evalFn:    mod.ExportedFunction("evaluate"),
+		healthy:   true,
+		pool:      p,
+		ephemeral: true,
+	}
+
+	if err := inst.takeSnapshot(); err != nil {
+		_ = mod.Close(ctx)
+		return nil, fmt.Errorf("pool: AcquireWithFS snapshot: %w", err)
+	}
+
+	return inst, nil
+}
+
 // Release restores the instance's snapshot and returns it to the pool.
 // If the instance is unhealthy, it is discarded and a replacement is spawned.
+// Ephemeral instances created by AcquireWithFS are always closed rather than
+// returned to the pool.
 func (p *wazeroPool) Release(inst Instance) {
 	wi, ok := inst.(*wasmInstance)
 	if !ok {
+		return
+	}
+
+	// Ephemeral instances (from AcquireWithFS) are one-shot: close and discard.
+	if wi.ephemeral {
+		go func() {
+			_ = wi.shutdown(context.Background())
+		}()
 		return
 	}
 

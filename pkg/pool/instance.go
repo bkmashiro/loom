@@ -28,6 +28,10 @@ type wasmInstance struct {
 
 	// pool is a back-reference used by Release to return the instance.
 	pool *wazeroPool
+
+	// ephemeral marks instances created by AcquireWithFS that should be closed
+	// on Release rather than returned to the pre-warm channel.
+	ephemeral bool
 }
 
 // requestEnvelope is marshalled and sent into the guest via alloc+evaluate.

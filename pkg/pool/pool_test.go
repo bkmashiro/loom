@@ -2,10 +2,12 @@ package pool
 
 import (
 	"context"
+	"io/fs"
 	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 )
 
@@ -123,6 +125,22 @@ func (mp *mockPool) Release(inst Instance) {
 	ch := mp.instances[inst.Language()]
 	mp.mu.Unlock()
 	ch <- inst
+}
+
+func (mp *mockPool) AcquireWithFS(ctx context.Context, lang Language, fsys fs.FS) (Instance, error) {
+	if fsys == nil {
+		return mp.Acquire(ctx, lang)
+	}
+	mp.mu.Lock()
+	ch, ok := mp.instances[lang]
+	mp.mu.Unlock()
+	if !ok {
+		return nil, ErrLanguageNotSupported
+	}
+	// For the mock, return a fresh mockInstance (not from the channel) to
+	// simulate per-execution isolation without depleting the pool.
+	_ = ch
+	return &mockInstance{lang: lang, runResult: map[string]any{"ok": true}}, nil
 }
 
 func (mp *mockPool) Start(_ context.Context) error  { return nil }
@@ -580,4 +598,74 @@ func TestWazeroPool_StatsInUse(t *testing.T) {
 
 	p.Release(inst1)
 	p.Release(inst2)
+}
+
+// -------------------------------------------------------------------------
+// AcquireWithFS tests
+// -------------------------------------------------------------------------
+
+func TestAcquireWithFS_NilFallback(t *testing.T) {
+	// AcquireWithFS(ctx, lang, nil) should behave the same as Acquire.
+	wasm := echoWASMPath(t)
+	cfg := PoolConfig{
+		Modules:          map[Language]string{LangJS: wasm},
+		InstancesPerLang: 2,
+		AcquireTimeout:   5 * time.Second,
+	}
+	p := NewPool(cfg)
+	ctx := context.Background()
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Shutdown(ctx)
+
+	inst, err := p.AcquireWithFS(ctx, LangJS, nil)
+	if err != nil {
+		t.Fatalf("AcquireWithFS(nil): %v", err)
+	}
+	if inst == nil {
+		t.Fatal("AcquireWithFS(nil) returned nil instance")
+	}
+	if inst.Language() != LangJS {
+		t.Errorf("Language: want %s, got %s", LangJS, inst.Language())
+	}
+
+	// Release must not panic.
+	p.Release(inst)
+}
+
+func TestAcquireWithFS_WithMemFS(t *testing.T) {
+	// AcquireWithFS with a real fs.FS should return a usable instance.
+	wasm := echoWASMPath(t)
+	cfg := PoolConfig{
+		Modules:          map[Language]string{LangJS: wasm},
+		InstancesPerLang: 2,
+		AcquireTimeout:   5 * time.Second,
+	}
+	p := NewPool(cfg)
+	ctx := context.Background()
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Shutdown(ctx)
+
+	memFS := fstest.MapFS{
+		"hello.txt": &fstest.MapFile{Data: []byte("hello from fs")},
+	}
+
+	inst, err := p.AcquireWithFS(ctx, LangJS, memFS)
+	if err != nil {
+		t.Fatalf("AcquireWithFS(memFS): %v", err)
+	}
+	if inst == nil {
+		t.Fatal("AcquireWithFS(memFS) returned nil instance")
+	}
+	if inst.Language() != LangJS {
+		t.Errorf("Language: want %s, got %s", LangJS, inst.Language())
+	}
+
+	// Release must not panic — ephemeral instance is closed, not pooled.
+	p.Release(inst)
 }

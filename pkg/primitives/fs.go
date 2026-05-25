@@ -1,8 +1,12 @@
 package primitives
 
 import (
+	"context"
 	"fmt"
+	"io/fs"
 	"strings"
+
+	"github.com/bkmashiro/loom/pkg/sandbox"
 )
 
 // FSCommand represents a parsed filesystem command from a step body line.
@@ -51,4 +55,46 @@ func ParseFSCommand(line string) (FSCommand, error) {
 		Path:    path,
 		Content: content,
 	}, nil
+}
+
+// ExecuteFS executes a parsed FSCommand against sb.
+// Returns (data any, err error).
+// data is:
+//   - []byte for ReadFile
+//   - []string of entry names for ReadDir (ls)
+//   - nil for WriteFile/AppendFile (success)
+func ExecuteFS(ctx context.Context, cmd FSCommand, sb *sandbox.Sandbox) (any, error) {
+	if sb == nil {
+		return nil, sandbox.ErrNoSandbox
+	}
+	switch cmd.Op {
+	case "read", "cat":
+		data, err := sb.ReadFile(cmd.Path)
+		if err != nil {
+			return nil, err
+		}
+		return data, nil
+	case "ls":
+		entries, err := sb.ReadDir(cmd.Path)
+		if err != nil {
+			return nil, err
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return names, nil
+	case "write":
+		if err := sb.WriteFile(cmd.Path, []byte(cmd.Content), fs.FileMode(0644)); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	case "append":
+		if err := sb.AppendFile(cmd.Path, []byte(cmd.Content)); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("sandbox: unknown FS op %q", cmd.Op)
+	}
 }

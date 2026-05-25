@@ -11,6 +11,7 @@ import (
 	"github.com/bkmashiro/loom/pkg/parser"
 	"github.com/bkmashiro/loom/pkg/pool"
 	"github.com/bkmashiro/loom/pkg/primitives"
+	"github.com/bkmashiro/loom/pkg/sandbox"
 )
 
 // Re-export key types so callers don't need to import sub-packages.
@@ -26,6 +27,7 @@ type Loom struct {
 	kv         primitives.KVStore
 	ioCacheCap int
 	ioCacheTTL time.Duration
+	sandboxCfg *sandbox.Config
 }
 
 // Option configures a Loom runtime.
@@ -62,6 +64,12 @@ func WithIOCache(cap int, ttl time.Duration) Option {
 	}
 }
 
+// WithSandbox configures the filesystem sandbox for each plan execution.
+// Each Run/Stream call creates an independent Sandbox instance from cfg.
+func WithSandbox(cfg sandbox.Config) Option {
+	return func(l *Loom) { l.sandboxCfg = &cfg }
+}
+
 // New creates a Loom with defaults (http.DefaultClient, in-memory KV, no WASM pool).
 func New(opts ...Option) *Loom {
 	l := &Loom{
@@ -80,8 +88,16 @@ func (l *Loom) RegisterTool(name string, fn ToolFunc) {
 	l.tools.Register(name, fn)
 }
 
-// newExecutor builds a StepExecutor from the current Loom configuration.
-func (l *Loom) newExecutor() *exec.StepExecutor {
+// openSandbox creates a new Sandbox from l.sandboxCfg, or returns nil if unconfigured.
+func (l *Loom) openSandbox() (*sandbox.Sandbox, error) {
+	if l.sandboxCfg == nil {
+		return nil, nil
+	}
+	return sandbox.New(*l.sandboxCfg)
+}
+
+// newExecutorWithSandbox builds a StepExecutor using the given sandbox (may be nil).
+func (l *Loom) newExecutorWithSandbox(sb *sandbox.Sandbox) *exec.StepExecutor {
 	return exec.NewStepExecutor(exec.StepExecutorConfig{
 		Pool:        l.pool,
 		HTTPClient:  l.httpClient,
@@ -89,13 +105,26 @@ func (l *Loom) newExecutor() *exec.StepExecutor {
 		KV:          l.kv,
 		IOCacheCap:  l.ioCacheCap,
 		IOCacheTTL:  l.ioCacheTTL,
+		Sandbox:     sb,
 	})
+}
+
+// newExecutor builds a StepExecutor from the current Loom configuration.
+func (l *Loom) newExecutor() *exec.StepExecutor {
+	return l.newExecutorWithSandbox(nil)
 }
 
 // Run parses a complete plan from r and executes it, returning the final result.
 // Blocks until the return step (or all steps) complete.
 func (l *Loom) Run(ctx context.Context, r io.Reader) (Result, error) {
-	executor := l.newExecutor()
+	sb, err := l.openSandbox()
+	if err != nil {
+		return Result{}, err
+	}
+	if sb != nil {
+		defer sb.Close()
+	}
+	executor := l.newExecutorWithSandbox(sb)
 	sched := dag.NewScheduler(ctx, executor)
 	p := parser.NewParser(r)
 	defer p.Close()
@@ -125,12 +154,22 @@ func (l *Loom) Run(ctx context.Context, r io.Reader) (Result, error) {
 // Stream parses a plan from r and returns a channel emitting StepResults as
 // each step completes. Channel is closed when all steps are done.
 func (l *Loom) Stream(ctx context.Context, r io.Reader) <-chan StepResult {
-	executor := l.newExecutor()
+	sb, err := l.openSandbox()
+	if err != nil {
+		// Return a channel that emits nothing — sandbox creation failure.
+		ch := make(chan StepResult)
+		close(ch)
+		return ch
+	}
+	executor := l.newExecutorWithSandbox(sb)
 	sched := dag.NewScheduler(ctx, executor)
 
 	ch := sched.Stream() // subscribe before parsing starts
 
 	go func() {
+		if sb != nil {
+			defer sb.Close()
+		}
 		p := parser.NewParser(r)
 		defer p.Close()
 		for event := range p.Events() {
