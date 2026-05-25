@@ -11,7 +11,7 @@ import (
 // Sentinel errors
 var (
 	ErrDuplicateStep      = errors.New("dag: duplicate step ID")
-	ErrForwardRef         = errors.New("dag: dependency references unknown step (forward references not allowed)")
+	ErrForwardRef         = errors.New("dag: dependency references unknown step (forward references not allowed)") // kept for compatibility; Submit no longer returns this
 	ErrCycle              = errors.New("dag: dependency cycle detected")
 	ErrReturnStepNotFound = errors.New("dag: return step was never submitted")
 	ErrReturnCancelled    = errors.New("dag: return step was cancelled due to upstream failure")
@@ -62,6 +62,7 @@ type Scheduler struct {
 	mu        sync.Mutex
 	cond      *sync.Cond // broadcast when any step completes
 	nodes     map[string]*node
+	awaiters  map[string][]string // dep step ID → list of step IDs waiting for it to be registered
 	completed int
 	pending   int // queued + running (decremented on complete/cancel)
 	sealed    bool
@@ -78,9 +79,10 @@ type Scheduler struct {
 // NewScheduler creates a scheduler that dispatches to exec.
 func NewScheduler(ctx context.Context, exec Executor) *Scheduler {
 	s := &Scheduler{
-		ctx:   ctx,
-		exec:  exec,
-		nodes: make(map[string]*node),
+		ctx:      ctx,
+		exec:     exec,
+		nodes:    make(map[string]*node),
+		awaiters: make(map[string][]string),
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.cond = sync.NewCond(&s.mu)
@@ -88,7 +90,9 @@ func NewScheduler(ctx context.Context, exec Executor) *Scheduler {
 }
 
 // Submit adds a step to the DAG. Dispatches immediately if all deps satisfied.
-// Returns ErrDuplicateStep, ErrForwardRef, or ErrCycle on error.
+// Forward references (deps not yet submitted) are allowed — the node is queued
+// until all deps exist and are complete.
+// Returns ErrDuplicateStep or ErrCycle on error.
 func (s *Scheduler) Submit(step parser.Step) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -97,13 +101,14 @@ func (s *Scheduler) Submit(step parser.Step) error {
 		return ErrDuplicateStep
 	}
 
-	// Check all deps exist (no forward references allowed)
+	// Build dep set; record forward references in awaiters.
 	depSet := make(map[string]struct{}, len(step.Deps))
 	for _, dep := range step.Deps {
-		if _, ok := s.nodes[dep]; !ok {
-			return ErrForwardRef
-		}
 		depSet[dep] = struct{}{}
+		if _, ok := s.nodes[dep]; !ok {
+			// Forward reference — register this step as an awaiter of dep.
+			s.awaiters[dep] = append(s.awaiters[dep], step.ID)
+		}
 	}
 
 	n := &node{
@@ -113,20 +118,31 @@ func (s *Scheduler) Submit(step parser.Step) error {
 	}
 	s.nodes[step.ID] = n
 
-	// Register this node as a dependent of each dep
+	// Wire up reverse deps for already-known deps.
 	for dep := range depSet {
-		s.nodes[dep].dependents = append(s.nodes[dep].dependents, step.ID)
+		if depNode, ok := s.nodes[dep]; ok {
+			depNode.dependents = append(depNode.dependents, step.ID)
+		}
 	}
 
-	// Cycle detection: DFS from new node through its deps
+	// Cycle detection through known nodes (unknown deps are simply skipped).
 	if err := s.detectCycle(step.ID); err != nil {
-		// Remove node we just added
+		// Rollback: remove the node and any reverse-dep wiring we just did.
 		delete(s.nodes, step.ID)
 		for dep := range depSet {
-			depNode := s.nodes[dep]
-			for i, d := range depNode.dependents {
-				if d == step.ID {
-					depNode.dependents = append(depNode.dependents[:i], depNode.dependents[i+1:]...)
+			if depNode, ok := s.nodes[dep]; ok {
+				for i, d := range depNode.dependents {
+					if d == step.ID {
+						depNode.dependents = append(depNode.dependents[:i], depNode.dependents[i+1:]...)
+						break
+					}
+				}
+			}
+			// Also remove from awaiters if we added a forward ref entry.
+			waiters := s.awaiters[dep]
+			for i, w := range waiters {
+				if w == step.ID {
+					s.awaiters[dep] = append(waiters[:i], waiters[i+1:]...)
 					break
 				}
 			}
@@ -136,7 +152,19 @@ func (s *Scheduler) Submit(step parser.Step) error {
 
 	s.pending++
 
-	// Check if all deps are already complete — if so, dispatch immediately
+	// Resolve awaiters: steps that were waiting for step.ID to be registered.
+	if waiters, ok := s.awaiters[step.ID]; ok {
+		delete(s.awaiters, step.ID)
+		for _, waiterID := range waiters {
+			waiterNode := s.nodes[waiterID]
+			if waiterNode != nil {
+				// Wire up the reverse dependent relationship now that this dep is known.
+				n.dependents = append(n.dependents, waiterID)
+			}
+		}
+	}
+
+	// Dispatch if all deps already complete (handles zero-dep and all-satisfied cases).
 	if s.allDepsComplete(n) {
 		s.dispatch(n)
 	}

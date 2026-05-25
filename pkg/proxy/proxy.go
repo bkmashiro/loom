@@ -18,12 +18,13 @@ import (
 
 // Handler is the main HTTP handler for Loom Proxy v2.
 type Handler struct {
-	upstream   *url.URL
-	httpClient *http.Client
-	loom       *loom.Loom
-	config     Config
-	logger     *slog.Logger
-	sessions   *SessionStore
+	upstream     *url.URL
+	httpClient   *http.Client
+	loom         *loom.Loom
+	config       Config
+	logger       *slog.Logger
+	sessions     *SessionStore
+	metrics      *Metrics
 	systemPrompt string // loaded from file at startup
 }
 
@@ -53,6 +54,7 @@ func NewHandler(cfg Config, l *loom.Loom) (*Handler, error) {
 		config:     cfg,
 		logger:     logger,
 		sessions:   NewSessionStore(cfg.SessionTTL),
+		metrics:    &Metrics{},
 	}
 
 	// Load system prompt from file if configured.
@@ -75,6 +77,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleHealth(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		h.handleModels(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/metrics":
+		h.metrics.Handler(h.sessions.Len).ServeHTTP(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -92,6 +96,8 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 
 // handleChatCompletions is the main entry point for chat completion requests.
 func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	h.metrics.RequestsTotal.Add(1)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
@@ -127,6 +133,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			)
 			session.PendingResults = nil
 			session.ExecutionDone = nil
+			h.metrics.Injections.Add(1)
 		}
 		session.Mu.Unlock()
 	}
@@ -144,6 +151,27 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// streamResult holds the outcome of processStream.
+type streamResult struct {
+	PlanText      string
+	AssistantText string
+	ToolCallID    string // non-empty if loom_describe was called
+}
+
+// injectLoomDescribeTool appends the loom_describe tool to req.Tools, unless already present or disabled.
+func (h *Handler) injectLoomDescribeTool(req ChatCompletionRequest) ChatCompletionRequest {
+	if !h.config.LoomDescribeEnabled {
+		return req
+	}
+	for _, t := range req.Tools {
+		if t.Function.Name == "loom_describe" {
+			return req // already present
+		}
+	}
+	req.Tools = append(req.Tools, LoomDescribeToolDef())
+	return req
+}
+
 // handleStreamingRequest processes a streaming request end-to-end.
 //
 // v2 flow:
@@ -152,6 +180,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 //  3. Next request for this session will block until execution finishes, then inject results.
 func (h *Handler) handleStreamingRequest(w http.ResponseWriter, r *http.Request, chatReq ChatCompletionRequest, sessionID string) {
 	chatReq.Stream = true
+	chatReq = h.injectLoomDescribeTool(chatReq)
 
 	upstreamResp, err := h.forwardToUpstream(r, chatReq)
 	if err != nil {
@@ -178,26 +207,77 @@ func (h *Handler) handleStreamingRequest(w http.ResponseWriter, r *http.Request,
 	w.WriteHeader(http.StatusOK)
 
 	sseWriter := NewSSEWriter(w)
-	planText, assistantText := h.processStream(r.Context(), upstreamResp.Body, sseWriter, h.config.PlanVisibility)
+	result := h.processStream(r.Context(), upstreamResp.Body, sseWriter, h.config.PlanVisibility)
+
+	if result.ToolCallID != "" {
+		// LLM called loom_describe — serve spec, re-call upstream, and finish.
+		h.handleLoomDescribeCall(w, r, chatReq, result.ToolCallID, sseWriter, sessionID)
+		return
+	}
 
 	// If plan detected, emit indicator text before [DONE].
-	if planText != "" && h.config.PlanVisibility == TeeModeIndicator {
+	if result.PlanText != "" && h.config.PlanVisibility == TeeModeIndicator {
 		sseWriter.WriteContent(h.config.IndicatorText) //nolint:errcheck
 	}
 
 	sseWriter.WriteDone() //nolint:errcheck
 
 	// === EGRESS: Launch background execution if plan detected. ===
-	if planText != "" {
+	if result.PlanText != "" {
 		h.logger.Debug("plan detected, launching background execution", "session", sessionID)
-		h.executeInBackground(sessionID, planText, assistantText)
+		h.metrics.PlansDetected.Add(1)
+		h.executeInBackground(sessionID, result.PlanText, result.AssistantText)
 	}
+}
+
+// handleLoomDescribeCall handles the case where the LLM called loom_describe.
+// It injects the spec as a tool result and makes a second upstream call,
+// streaming the final response to the client.
+func (h *Handler) handleLoomDescribeCall(w http.ResponseWriter, r *http.Request, origReq ChatCompletionRequest, toolCallID string, sw *SSEWriter, sessionID string) {
+	// Build messages: original + assistant(tool_calls) + tool(spec result)
+	specMessages := append(origReq.Messages,
+		Message{
+			Role: "assistant",
+			ToolCalls: []ToolCall{{
+				ID:   toolCallID,
+				Type: "function",
+				Function: ToolCallFunction{Name: "loom_describe", Arguments: "{}"},
+			}},
+		},
+		Message{
+			Role:       "tool",
+			ToolCallID: toolCallID,
+			Content:    BuildLoomSpec(),
+		},
+	)
+	secondReq := origReq
+	secondReq.Messages = specMessages
+	secondReq.Tools = nil // don't re-inject to avoid infinite loop
+
+	resp, err := h.forwardToUpstream(r, secondReq)
+	if err != nil {
+		h.logger.Error("loom_describe second upstream call failed", "err", err)
+		sw.WriteDone() //nolint:errcheck
+		return
+	}
+	defer resp.Body.Close()
+
+	result := h.processStream(r.Context(), resp.Body, sw, h.config.PlanVisibility)
+	if result.PlanText != "" {
+		if h.config.PlanVisibility == TeeModeIndicator {
+			sw.WriteContent(h.config.IndicatorText) //nolint:errcheck
+		}
+		h.metrics.PlansDetected.Add(1)
+		h.executeInBackground(sessionID, result.PlanText, result.AssistantText)
+	}
+	sw.WriteDone() //nolint:errcheck
 }
 
 // handleNonStreamingRequest processes a non-streaming request.
 // Internally always uses streaming for plan detection, then assembles a JSON response.
 func (h *Handler) handleNonStreamingRequest(w http.ResponseWriter, r *http.Request, chatReq ChatCompletionRequest, sessionID string) {
 	chatReq.Stream = true
+	chatReq = h.injectLoomDescribeTool(chatReq)
 
 	upstreamResp, err := h.forwardToUpstream(r, chatReq)
 	if err != nil {
@@ -219,15 +299,48 @@ func (h *Handler) handleNonStreamingRequest(w http.ResponseWriter, r *http.Reque
 
 	// Accumulate content via a capturing writer.
 	capWriter := &capturingSSEWriter{}
-	planText, assistantText := h.processStream(r.Context(), upstreamResp.Body, capWriter, h.config.PlanVisibility)
+	result := h.processStream(r.Context(), upstreamResp.Body, capWriter, h.config.PlanVisibility)
+
+	// If loom_describe was called, make a second upstream call and accumulate that response.
+	if result.ToolCallID != "" {
+		specMessages := append(chatReq.Messages,
+			Message{
+				Role: "assistant",
+				ToolCalls: []ToolCall{{
+					ID:   result.ToolCallID,
+					Type: "function",
+					Function: ToolCallFunction{Name: "loom_describe", Arguments: "{}"},
+				}},
+			},
+			Message{
+				Role:       "tool",
+				ToolCallID: result.ToolCallID,
+				Content:    BuildLoomSpec(),
+			},
+		)
+		secondReq := chatReq
+		secondReq.Messages = specMessages
+		secondReq.Tools = nil
+
+		resp2, err := h.forwardToUpstream(r, secondReq)
+		if err != nil {
+			http.Error(w, "loom_describe second upstream call failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp2.Body.Close()
+
+		capWriter = &capturingSSEWriter{}
+		result = h.processStream(r.Context(), resp2.Body, capWriter, h.config.PlanVisibility)
+	}
 
 	// Determine what the client sees as the final content.
 	finalContent := capWriter.String()
 
 	// === EGRESS: Launch background execution if plan detected. ===
-	if planText != "" {
+	if result.PlanText != "" {
 		h.logger.Debug("plan detected (non-streaming), launching background execution", "session", sessionID)
-		h.executeInBackground(sessionID, planText, assistantText)
+		h.metrics.PlansDetected.Add(1)
+		h.executeInBackground(sessionID, result.PlanText, result.AssistantText)
 	}
 
 	// Assemble JSON response.
@@ -269,17 +382,29 @@ func (h *Handler) handleNonStreamingRequest(w http.ResponseWriter, r *http.Reque
 }
 
 // processStream reads the upstream SSE body, forwards content to sw per visibility config,
-// and returns (planText, fullAssistantText). If no plan was detected, both are empty.
+// and returns a streamResult. If no plan was detected, PlanText and AssistantText are empty.
+// If loom_describe was called, ToolCallID is non-empty.
 //
 // v2 simplification: no mid-stream stop, no ActionPlanComplete. Plan completion
 // is determined after [DONE] via detector.HasPlan().
-func (h *Handler) processStream(ctx context.Context, body io.Reader, sw sseWriterIface, visibility TeeMode) (planText, fullAssistantText string) {
+func (h *Handler) processStream(ctx context.Context, body io.Reader, sw sseWriterIface, visibility TeeMode) streamResult {
 	detector := &PlanDetector{}
 	// lastBufLen tracks how many bytes of partial-line content we've sent to the
 	// client via ActionBuffer, so ActionForward can send only the remaining delta.
 	var lastBufLen int
+	var toolCallID, toolCallName string
 
 	err := ParseSSEStream(body, func(data []byte) error {
+		// Check for tool_call before content processing.
+		if id, name, ok := ChunkToolCall(data); ok {
+			if toolCallID == "" {
+				toolCallID = id
+			}
+			if toolCallName == "" {
+				toolCallName = name
+			}
+		}
+
 		content, ok := ChunkContent(data)
 		if !ok {
 			// Non-content chunk (role delta, etc.) — forward unless in plan context.
@@ -344,11 +469,19 @@ func (h *Handler) processStream(ctx context.Context, body io.Reader, sw sseWrite
 		h.logger.Error("SSE stream error", "err", err)
 	}
 
-	if !detector.HasPlan() {
-		return "", ""
+	// If loom_describe was called, return immediately with the tool call info.
+	if toolCallName == "loom_describe" {
+		return streamResult{ToolCallID: toolCallID}
 	}
 
-	return detector.PlanText(), detector.PrePlanText() + detector.PlanText()
+	if !detector.HasPlan() {
+		return streamResult{}
+	}
+
+	return streamResult{
+		PlanText:      detector.PlanText(),
+		AssistantText: detector.PrePlanText() + detector.PlanText(),
+	}
 }
 
 // resolveSessionID determines the session ID for this request.
@@ -391,8 +524,10 @@ func (h *Handler) executeInBackground(sessionID, planText, assistantText string)
 	session.LastAssistantMessage = assistantText
 	session.Mu.Unlock()
 
+	h.metrics.PendingExecs.Add(1)
 	go func() {
 		defer close(done)
+		defer h.metrics.PendingExecs.Add(-1)
 
 		ctx, cancel := context.WithTimeout(context.Background(), h.config.Timeout)
 		defer cancel()

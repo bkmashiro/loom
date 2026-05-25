@@ -35,6 +35,8 @@ type Config struct {
 
 	LogLevel    string
 	MaxPlanSize int
+
+	LoomDescribeEnabled bool
 }
 
 // DefaultConfig returns sensible defaults for Loom Proxy v2.
@@ -48,8 +50,9 @@ func DefaultConfig() Config {
 		SessionTTL:       5 * time.Minute,
 		InjectionRole:    "tool",
 		SystemPromptMode: "prepend",
-		LogLevel:         "info",
-		MaxPlanSize:      65536,
+		LogLevel:             "info",
+		MaxPlanSize:          65536,
+		LoomDescribeEnabled:  true,
 	}
 }
 
@@ -106,6 +109,9 @@ func ConfigFromEnv() Config {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.MaxPlanSize = n
 		}
+	}
+	if v := os.Getenv("LOOM_DESCRIBE_ENABLED"); v == "false" {
+		c.LoomDescribeEnabled = false
 	}
 	return c
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/bkmashiro/loom/pkg/dag"
 	"github.com/bkmashiro/loom/pkg/exec"
@@ -23,6 +24,8 @@ type Loom struct {
 	httpClient *http.Client
 	tools      *exec.ToolRegistry
 	kv         primitives.KVStore
+	ioCacheCap int
+	ioCacheTTL time.Duration
 }
 
 // Option configures a Loom runtime.
@@ -49,6 +52,16 @@ func WithKV(store primitives.KVStore) Option {
 	}
 }
 
+// WithIOCache enables the per-executor LRU+TTL cache for IO step results.
+// cap is the maximum number of entries; ttl is how long each entry lives.
+// Both must be > 0 for the cache to be enabled.
+func WithIOCache(cap int, ttl time.Duration) Option {
+	return func(l *Loom) {
+		l.ioCacheCap = cap
+		l.ioCacheTTL = ttl
+	}
+}
+
 // New creates a Loom with defaults (http.DefaultClient, in-memory KV, no WASM pool).
 func New(opts ...Option) *Loom {
 	l := &Loom{
@@ -70,10 +83,12 @@ func (l *Loom) RegisterTool(name string, fn ToolFunc) {
 // newExecutor builds a StepExecutor from the current Loom configuration.
 func (l *Loom) newExecutor() *exec.StepExecutor {
 	return exec.NewStepExecutor(exec.StepExecutorConfig{
-		Pool:       l.pool,
-		HTTPClient: l.httpClient,
-		Tools:      l.tools,
-		KV:         l.kv,
+		Pool:        l.pool,
+		HTTPClient:  l.httpClient,
+		Tools:       l.tools,
+		KV:          l.kv,
+		IOCacheCap:  l.ioCacheCap,
+		IOCacheTTL:  l.ioCacheTTL,
 	})
 }
 

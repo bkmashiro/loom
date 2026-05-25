@@ -252,13 +252,13 @@ func TestCycleDetection(t *testing.T) {
 	// Let's verify that even with our cycle detection code working,
 	// we get ErrForwardRef before ErrCycle in normal scenarios.
 
-	// Forward ref test (which inherently prevents cycles):
+	// Forward references are now allowed — unknown dep should not return an error.
 	err := sched.Submit(step("Z", "NONEXISTENT"))
-	if err != ErrForwardRef {
-		t.Errorf("expected ErrForwardRef, got %v", err)
+	if err != nil {
+		t.Errorf("expected no error for forward ref, got %v", err)
 	}
 
-	// Wait for completion
+	// Wait for X and Y (Z will remain queued waiting for NONEXISTENT).
 	sched.wg.Wait()
 }
 
@@ -301,15 +301,33 @@ func TestCycleDetectionSelfLoop(t *testing.T) {
 	}
 }
 
-// Test 5: Forward reference
+// Test 5: Forward reference — Submit now accepts deps that haven't been registered yet.
 func TestForwardReference(t *testing.T) {
 	exec := newMockExecutor()
+	exec.results["A"] = "a-result"
+	exec.results["B"] = "b-result"
 	ctx := context.Background()
 	sched := NewScheduler(ctx, exec)
 
-	err := sched.Submit(step("B", "A")) // A hasn't been submitted yet
-	if err != ErrForwardRef {
-		t.Errorf("expected ErrForwardRef, got %v", err)
+	// Submit B before A — should succeed (forward reference allowed).
+	if err := sched.Submit(step("B", "A")); err != nil {
+		t.Fatalf("expected no error for forward ref, got %v", err)
+	}
+	// Now submit A — B should eventually execute after A completes.
+	if err := sched.Submit(step("A")); err != nil {
+		t.Fatalf("Submit A: %v", err)
+	}
+
+	sched.SetReturn("B")
+	result, err := sched.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if result.StepID != "B" || result.Data != "b-result" {
+		t.Errorf("expected B result b-result, got stepID=%q data=%v", result.StepID, result.Data)
+	}
+	if !exec.hasCalled("A") || !exec.hasCalled("B") {
+		t.Errorf("expected both A and B to execute, calls=%v", exec.getCalls())
 	}
 }
 
@@ -602,4 +620,133 @@ func (e *capturingExecutor) Execute(ctx context.Context, s parser.Step, inputs m
 		e.onCapture(inputs)
 	}
 	return Result{StepID: s.ID, Data: e.results[s.ID]}, nil
+}
+
+// TestScheduler_ForwardRef_BasicOrder — submit B (depends on A) before A;
+// both execute in correct order.
+func TestScheduler_ForwardRef_BasicOrder(t *testing.T) {
+	exec := newMockExecutor()
+	exec.results["A"] = "a-result"
+	exec.results["B"] = "b-result"
+
+	ctx := context.Background()
+	sched := NewScheduler(ctx, exec)
+
+	// Submit B first — forward reference to A.
+	if err := sched.Submit(step("B", "A")); err != nil {
+		t.Fatalf("Submit B (forward ref): %v", err)
+	}
+	// Now submit A.
+	if err := sched.Submit(step("A")); err != nil {
+		t.Fatalf("Submit A: %v", err)
+	}
+
+	sched.SetReturn("B")
+	result, err := sched.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	if result.StepID != "B" {
+		t.Errorf("expected return step B, got %q", result.StepID)
+	}
+	if result.Data != "b-result" {
+		t.Errorf("expected b-result, got %v", result.Data)
+	}
+
+	calls := exec.getCalls()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 calls, got %v", calls)
+	}
+	// A must execute before B.
+	aIdx, bIdx := -1, -1
+	for i, id := range calls {
+		switch id {
+		case "A":
+			aIdx = i
+		case "B":
+			bIdx = i
+		}
+	}
+	if aIdx == -1 || bIdx == -1 {
+		t.Fatalf("not all steps executed: %v", calls)
+	}
+	if aIdx >= bIdx {
+		t.Errorf("A must execute before B; order: %v", calls)
+	}
+}
+
+// TestScheduler_ForwardRef_ChainedOrder — submit C→B→A in reverse order;
+// all three execute in the correct A→B→C order.
+func TestScheduler_ForwardRef_ChainedOrder(t *testing.T) {
+	exec := newMockExecutor()
+	exec.results["A"] = "a-result"
+	exec.results["B"] = "b-result"
+	exec.results["C"] = "c-result"
+
+	ctx := context.Background()
+	sched := NewScheduler(ctx, exec)
+
+	// Submit in reverse topological order.
+	if err := sched.Submit(step("C", "B")); err != nil {
+		t.Fatalf("Submit C: %v", err)
+	}
+	if err := sched.Submit(step("B", "A")); err != nil {
+		t.Fatalf("Submit B: %v", err)
+	}
+	if err := sched.Submit(step("A")); err != nil {
+		t.Fatalf("Submit A: %v", err)
+	}
+
+	sched.SetReturn("C")
+	result, err := sched.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	if result.StepID != "C" || result.Data != "c-result" {
+		t.Errorf("expected C/c-result, got stepID=%q data=%v", result.StepID, result.Data)
+	}
+
+	calls := exec.getCalls()
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 calls, got %v", calls)
+	}
+	idx := make(map[string]int, 3)
+	for i, id := range calls {
+		idx[id] = i
+	}
+	if _, ok := idx["A"]; !ok {
+		t.Fatal("A was not executed")
+	}
+	if _, ok := idx["B"]; !ok {
+		t.Fatal("B was not executed")
+	}
+	if _, ok := idx["C"]; !ok {
+		t.Fatal("C was not executed")
+	}
+	if idx["A"] >= idx["B"] {
+		t.Errorf("A must execute before B; order: %v", calls)
+	}
+	if idx["B"] >= idx["C"] {
+		t.Errorf("B must execute before C; order: %v", calls)
+	}
+}
+
+// TestScheduler_ForwardRef_CycleDetection — A depends on B, B depends on A
+// (submitted out of order) → ErrCycle returned on the second submit.
+func TestScheduler_ForwardRef_CycleDetection(t *testing.T) {
+	exec := newMockExecutor()
+	ctx := context.Background()
+	sched := NewScheduler(ctx, exec)
+
+	// Submit A depending on B — forward reference, should succeed.
+	if err := sched.Submit(step("A", "B")); err != nil {
+		t.Fatalf("Submit A(dep B): %v", err)
+	}
+	// Submit B depending on A — this creates a cycle: A→B and B→A.
+	err := sched.Submit(step("B", "A"))
+	if err != ErrCycle {
+		t.Errorf("expected ErrCycle, got %v", err)
+	}
 }

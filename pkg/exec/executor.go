@@ -57,10 +57,12 @@ func (r *ToolRegistry) Get(name string) (ToolFunc, bool) {
 
 // StepExecutorConfig holds configuration for StepExecutor.
 type StepExecutorConfig struct {
-	Pool       pool.Pool          // may be nil (WASM steps will fail if nil)
-	HTTPClient *http.Client       // if nil, use http.DefaultClient
-	Tools      *ToolRegistry      // if nil, escape steps always return ErrToolNotFound
-	KV         primitives.KVStore // if nil, kv steps are not supported
+	Pool        pool.Pool          // may be nil (WASM steps will fail if nil)
+	HTTPClient  *http.Client       // if nil, use http.DefaultClient
+	Tools       *ToolRegistry      // if nil, escape steps always return ErrToolNotFound
+	KV          primitives.KVStore // if nil, kv steps are not supported
+	IOCacheCap  int                // 0 = disabled
+	IOCacheTTL  time.Duration      // 0 = disabled
 }
 
 // StepExecutor implements dag.Executor, routing each step by type.
@@ -70,6 +72,7 @@ type StepExecutor struct {
 	tools      *ToolRegistry
 	kv         primitives.KVStore
 	sf         singleflight.Group
+	cache      *IOCache // nil if caching disabled
 }
 
 // Ensure interface is satisfied.
@@ -81,12 +84,16 @@ func NewStepExecutor(cfg StepExecutorConfig) *StepExecutor {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &StepExecutor{
+	e := &StepExecutor{
 		pool:       cfg.Pool,
 		httpClient: client,
 		tools:      cfg.Tools,
 		kv:         cfg.KV,
 	}
+	if cfg.IOCacheCap > 0 && cfg.IOCacheTTL > 0 {
+		e.cache = NewIOCache(cfg.IOCacheCap, cfg.IOCacheTTL)
+	}
+	return e
 }
 
 // Execute runs a single step, routing by StepType.
@@ -182,6 +189,7 @@ func firstNonEmpty(s string) string {
 // executeIO parses the first non-empty line as an HTTP request and executes it.
 // If retryable, retries on 5xx or network errors up to 3 times with exponential backoff.
 // Identical concurrent requests (same method+url+body) are coalesced via singleflight.
+// For retryable (IO) steps, results are stored in the LRU+TTL cache (if configured).
 func (e *StepExecutor) executeIO(ctx context.Context, body string, retryable bool) (any, error) {
 	line := firstNonEmpty(body)
 	if line == "" {
@@ -193,10 +201,19 @@ func (e *StepExecutor) executeIO(ctx context.Context, body string, retryable boo
 		return nil, fmt.Errorf("exec: parse HTTP request: %w", err)
 	}
 
-	// Singleflight key: method + URL + body to coalesce identical concurrent requests.
-	key := req.Method + " " + req.URL + " " + req.Body
+	// Cache lookup: only for retryable (idempotent) IO steps.
+	var ck string
+	if e.cache != nil && retryable {
+		ck = cacheKey(req.Method, req.URL, req.Body)
+		if cached, ok := e.cache.Get(ck); ok {
+			return cached, nil
+		}
+	}
 
-	result, err, _ := e.sf.Do(key, func() (any, error) {
+	// Singleflight key: method + URL + body to coalesce identical concurrent requests.
+	sfKey := req.Method + " " + req.URL + " " + req.Body
+
+	result, err, _ := e.sf.Do(sfKey, func() (any, error) {
 		if !retryable {
 			return e.doHTTP(ctx, req)
 		}
@@ -224,6 +241,12 @@ func (e *StepExecutor) executeIO(ctx context.Context, body string, retryable boo
 		}
 		return nil, lastErr
 	})
+
+	// Store successful result in cache for retryable steps.
+	if err == nil && e.cache != nil && retryable {
+		e.cache.Set(ck, result)
+	}
+
 	return result, err
 }
 

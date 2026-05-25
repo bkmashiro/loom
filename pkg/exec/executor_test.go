@@ -24,6 +24,13 @@ func makeExecutor(opts ...func(*StepExecutorConfig)) *StepExecutor {
 	return NewStepExecutor(cfg)
 }
 
+func withCache(cap int, ttl time.Duration) func(*StepExecutorConfig) {
+	return func(cfg *StepExecutorConfig) {
+		cfg.IOCacheCap = cap
+		cfg.IOCacheTTL = ttl
+	}
+}
+
 func withClient(c *http.Client) func(*StepExecutorConfig) {
 	return func(cfg *StepExecutorConfig) { cfg.HTTPClient = c }
 }
@@ -335,5 +342,93 @@ func TestSingleflight(t *testing.T) {
 	n := atomic.LoadInt32(&callCount)
 	if n != 1 {
 		t.Errorf("expected 1 HTTP call (singleflight coalescing), got %d", n)
+	}
+}
+
+// --- Test 10: IO cache hit avoids second HTTP request ---
+
+func TestExecutor_IOCacheHit(t *testing.T) {
+	var callCount int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		fmt.Fprint(w, "cached-result")
+	}))
+	defer srv.Close()
+
+	e := makeExecutor(
+		withClient(srv.Client()),
+		withCache(128, time.Minute),
+	)
+
+	step := parser.Step{
+		ID:   "fetch",
+		Type: parser.IO,
+		Body: "GET " + srv.URL + "/data",
+	}
+
+	// First call — should hit the server.
+	res1, err := e.Execute(context.Background(), step, nil)
+	if err != nil {
+		t.Fatalf("first Execute: %v", err)
+	}
+	if res1.Data != "cached-result" {
+		t.Errorf("expected 'cached-result', got %v", res1.Data)
+	}
+
+	// Second identical call — should be served from cache.
+	res2, err := e.Execute(context.Background(), step, nil)
+	if err != nil {
+		t.Fatalf("second Execute: %v", err)
+	}
+	if res2.Data != "cached-result" {
+		t.Errorf("expected 'cached-result', got %v", res2.Data)
+	}
+
+	// Only one HTTP call should have been made.
+	n := atomic.LoadInt32(&callCount)
+	if n != 1 {
+		t.Errorf("expected 1 HTTP call with cache enabled, got %d", n)
+	}
+}
+
+// --- Test 11: Write steps are not cached ---
+
+func TestExecutor_WriteNotCached(t *testing.T) {
+	var callCount int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		fmt.Fprint(w, "write-result")
+	}))
+	defer srv.Close()
+
+	e := makeExecutor(
+		withClient(srv.Client()),
+		withCache(128, time.Minute),
+	)
+
+	step := parser.Step{
+		ID:   "write",
+		Type: parser.Write,
+		Body: "POST " + srv.URL + "/data",
+	}
+
+	// First Write call.
+	_, err := e.Execute(context.Background(), step, nil)
+	if err != nil {
+		t.Fatalf("first Execute: %v", err)
+	}
+
+	// Second identical Write call — must NOT be served from cache.
+	_, err = e.Execute(context.Background(), step, nil)
+	if err != nil {
+		t.Fatalf("second Execute: %v", err)
+	}
+
+	// Both calls must reach the server (Write steps are never cached).
+	n := atomic.LoadInt32(&callCount)
+	if n != 2 {
+		t.Errorf("expected 2 HTTP calls for Write steps (no cache), got %d", n)
 	}
 }

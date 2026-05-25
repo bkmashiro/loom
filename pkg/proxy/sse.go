@@ -55,6 +55,44 @@ func ChunkContent(data []byte) (string, bool) {
 	return content, true
 }
 
+// chunkToolCallFields is used for JSON unmarshaling of tool_call deltas.
+type chunkToolCallFields struct {
+	Choices []struct {
+		Delta struct {
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+// ChunkToolCall extracts the first tool_call from an SSE chunk.
+// Returns (id, name, ok). Only returns ok=true when a function name is present.
+func ChunkToolCall(data []byte) (id, name string, ok bool) {
+	var chunk chunkToolCallFields
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return "", "", false
+	}
+	if len(chunk.Choices) == 0 {
+		return "", "", false
+	}
+	toolCalls := chunk.Choices[0].Delta.ToolCalls
+	if len(toolCalls) == 0 {
+		return "", "", false
+	}
+	tc := toolCalls[0]
+	if tc.Function.Name == "" {
+		return "", "", false
+	}
+	return tc.ID, tc.Function.Name, true
+}
+
 // SSEWriter writes SSE events to an http.ResponseWriter with flush after each.
 type SSEWriter struct {
 	w       http.ResponseWriter

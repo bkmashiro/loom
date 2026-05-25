@@ -34,6 +34,20 @@ type ChatCompletionRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
 	Stream   bool      `json:"stream"`
+	Tools    []Tool    `json:"tools,omitempty"`
+}
+
+// Tool represents an OpenAI-compatible tool definition.
+type Tool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+// ToolFunction holds the function name, description, and parameters schema.
+type ToolFunction struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Parameters  any    `json:"parameters"`
 }
 
 // loomToolCallID is the synthetic tool_call_id used for injected results.
