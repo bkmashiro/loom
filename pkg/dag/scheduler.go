@@ -201,16 +201,25 @@ func (s *Scheduler) collectInputs(n *node) map[string]Result {
 }
 
 // publishToStream sends a StepResult to all stream subscribers (best-effort, non-blocking).
+// Uses recover to safely handle sends to channels that were closed concurrently by
+// the Stream() goroutine between the subscriber snapshot and the actual send.
 func (s *Scheduler) publishToStream(sr StepResult) {
 	s.streamMu.Lock()
 	subs := s.streamSubs
 	s.streamMu.Unlock()
 	for _, ch := range subs {
-		select {
-		case ch <- sr:
-		default:
-			// Subscriber channel is full; drop rather than block
-		}
+		streamSafeSend(ch, sr)
+	}
+}
+
+// streamSafeSend attempts a non-blocking send to ch.
+// If ch is closed (race with Stream() goroutine), the panic is recovered silently.
+func streamSafeSend(ch chan StepResult, sr StepResult) {
+	defer func() { recover() }() //nolint:errcheck
+	select {
+	case ch <- sr:
+	default:
+		// Channel full — drop rather than block.
 	}
 }
 

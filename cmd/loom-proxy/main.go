@@ -24,8 +24,9 @@ func main() {
 	flag.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log level: debug, info, warn, error")
 	flag.StringVar(&cfg.SystemPromptFile, "system-prompt-file", cfg.SystemPromptFile, "Path to Loom system prompt to inject")
 	flag.StringVar(&cfg.SystemPromptMode, "system-prompt-mode", cfg.SystemPromptMode, "How to merge system prompt: prepend, append, replace")
-	flag.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "Per-request timeout")
-	flag.DurationVar(&cfg.PlanTimeout, "plan-timeout", cfg.PlanTimeout, "Timeout for Loom plan execution")
+	flag.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "Per-request timeout (also bounds background plan execution)")
+	flag.DurationVar(&cfg.SessionTTL, "session-ttl", cfg.SessionTTL, "Session expiration after inactivity")
+	flag.StringVar(&cfg.InjectionRole, "injection-role", cfg.InjectionRole, "Role for injected results: tool or user")
 
 	planVisibility := flag.String("plan-visibility", "", "Plan visibility: passthrough, suppress, indicator")
 	flag.Parse()

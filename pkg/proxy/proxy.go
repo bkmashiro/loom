@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,17 +16,14 @@ import (
 	"github.com/bkmashiro/loom/pkg/loom"
 )
 
-// errStopSSE is a sentinel error used to break out of ParseSSEStream when a plan
-// is complete. ParseSSEStream treats this as a clean stop (not propagated).
-var errStopSSE = errors.New("proxy: plan complete, stop SSE")
-
-// Handler is the main HTTP handler for Loom Proxy.
+// Handler is the main HTTP handler for Loom Proxy v2.
 type Handler struct {
-	upstream     *url.URL
-	httpClient   *http.Client
-	loom         *loom.Loom
-	config       Config
-	logger       *slog.Logger
+	upstream   *url.URL
+	httpClient *http.Client
+	loom       *loom.Loom
+	config     Config
+	logger     *slog.Logger
+	sessions   *SessionStore
 	systemPrompt string // loaded from file at startup
 }
 
@@ -56,9 +52,10 @@ func NewHandler(cfg Config, l *loom.Loom) (*Handler, error) {
 		loom:       l,
 		config:     cfg,
 		logger:     logger,
+		sessions:   NewSessionStore(cfg.SessionTTL),
 	}
 
-	// Load system prompt from file if configured
+	// Load system prompt from file if configured.
 	if cfg.SystemPromptFile != "" {
 		data, err := os.ReadFile(cfg.SystemPromptFile)
 		if err != nil {
@@ -101,30 +98,59 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Parse the request
 	var chatReq ChatCompletionRequest
 	if err := json.Unmarshal(body, &chatReq); err != nil {
 		http.Error(w, "failed to parse request body", http.StatusBadRequest)
 		return
 	}
 
-	// Inject system prompt if configured
+	// === INGRESS: Resolve session and inject any pending results. ===
+	sessionID := h.resolveSessionID(r, chatReq.Messages)
+	session := h.sessions.Get(sessionID)
+
+	if session != nil {
+		// Block until any in-flight background execution completes.
+		if err := h.waitForPendingExecution(r.Context(), session); err != nil {
+			http.Error(w, "timed out waiting for plan execution: "+err.Error(), http.StatusGatewayTimeout)
+			return
+		}
+
+		// Inject pending results into the messages.
+		session.Mu.Lock()
+		if session.PendingResults != nil {
+			h.logger.Debug("injecting pending results", "session", sessionID, "steps", len(session.PendingResults))
+			chatReq.Messages = InjectResults(
+				chatReq.Messages,
+				session.LastAssistantMessage,
+				session.PendingResults,
+				h.config.InjectionRole,
+			)
+			session.PendingResults = nil
+			session.ExecutionDone = nil
+		}
+		session.Mu.Unlock()
+	}
+
+	// Inject system prompt if configured.
 	if h.systemPrompt != "" {
 		chatReq.Messages = injectSystemPrompt(chatReq.Messages, h.systemPrompt, h.config.SystemPromptMode)
 	}
 
-	// Check if client wants non-streaming
 	clientWantsStream := chatReq.Stream
-
 	if clientWantsStream {
-		h.handleStreamingRequest(w, r, chatReq)
+		h.handleStreamingRequest(w, r, chatReq, sessionID)
 	} else {
-		h.handleNonStreamingRequest(w, r, chatReq)
+		h.handleNonStreamingRequest(w, r, chatReq, sessionID)
 	}
 }
 
 // handleStreamingRequest processes a streaming request end-to-end.
-func (h *Handler) handleStreamingRequest(w http.ResponseWriter, r *http.Request, chatReq ChatCompletionRequest) {
+//
+// v2 flow:
+//  1. Forward to upstream, relay SSE to client.
+//  2. After [DONE], if a plan was detected, launch background execution.
+//  3. Next request for this session will block until execution finishes, then inject results.
+func (h *Handler) handleStreamingRequest(w http.ResponseWriter, r *http.Request, chatReq ChatCompletionRequest, sessionID string) {
 	chatReq.Stream = true
 
 	upstreamResp, err := h.forwardToUpstream(r, chatReq)
@@ -135,7 +161,6 @@ func (h *Handler) handleStreamingRequest(w http.ResponseWriter, r *http.Request,
 	defer upstreamResp.Body.Close()
 
 	if upstreamResp.StatusCode != http.StatusOK {
-		// Forward error response as-is
 		for key, values := range upstreamResp.Header {
 			for _, v := range values {
 				w.Header().Add(key, v)
@@ -146,58 +171,32 @@ func (h *Handler) handleStreamingRequest(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Set up SSE response headers
+	// Set up SSE response headers.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
 	sseWriter := NewSSEWriter(w)
-	planText, prePlanText, planDetected := h.processFirstStream(r.Context(), upstreamResp.Body, sseWriter, chatReq)
+	planText, assistantText := h.processStream(r.Context(), upstreamResp.Body, sseWriter, h.config.PlanVisibility)
 
-	if !planDetected {
-		sseWriter.WriteDone() //nolint:errcheck
-		return
+	// If plan detected, emit indicator text before [DONE].
+	if planText != "" && h.config.PlanVisibility == TeeModeIndicator {
+		sseWriter.WriteContent(h.config.IndicatorText) //nolint:errcheck
 	}
 
-	// Execute Loom plan
-	planCtx, cancel := context.WithTimeout(r.Context(), h.config.PlanTimeout)
-	defer cancel()
-
-	results := collectStepResults(planCtx, h.loom, planText)
-
-	// Build second request
-	injector := &ResultInjector{
-		OriginalMessages: chatReq.Messages,
-		PrePlanText:      prePlanText,
-		Results:          results,
-		Model:            chatReq.Model,
-	}
-	secondReq := injector.BuildRequest()
-
-	secondResp, err := h.forwardToUpstream(r, secondReq)
-	if err != nil {
-		h.logger.Error("second LLM call failed", "err", err)
-		sseWriter.WriteContent("Error: " + err.Error()) //nolint:errcheck
-		sseWriter.WriteDone()                           //nolint:errcheck
-		return
-	}
-	defer secondResp.Body.Close()
-
-	// Forward second response to client
-	err = ParseSSEStream(secondResp.Body, func(data []byte) error {
-		return sseWriter.WriteChunk(data)
-	})
-	if err != nil {
-		h.logger.Error("SSE relay error (second call)", "err", err)
-	}
 	sseWriter.WriteDone() //nolint:errcheck
+
+	// === EGRESS: Launch background execution if plan detected. ===
+	if planText != "" {
+		h.logger.Debug("plan detected, launching background execution", "session", sessionID)
+		h.executeInBackground(sessionID, planText, assistantText)
+	}
 }
 
 // handleNonStreamingRequest processes a non-streaming request.
-// Internally always uses streaming to detect plans, then assembles a JSON response.
-func (h *Handler) handleNonStreamingRequest(w http.ResponseWriter, r *http.Request, chatReq ChatCompletionRequest) {
-	// Force streaming upstream for plan detection
+// Internally always uses streaming for plan detection, then assembles a JSON response.
+func (h *Handler) handleNonStreamingRequest(w http.ResponseWriter, r *http.Request, chatReq ChatCompletionRequest, sessionID string) {
 	chatReq.Stream = true
 
 	upstreamResp, err := h.forwardToUpstream(r, chatReq)
@@ -218,49 +217,20 @@ func (h *Handler) handleNonStreamingRequest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Accumulate all content via a capturing SSE writer.
+	// Accumulate content via a capturing writer.
 	capWriter := &capturingSSEWriter{}
-	planText, prePlanText, planDetected := h.processFirstStreamCore(r.Context(), upstreamResp.Body, capWriter, chatReq)
+	planText, assistantText := h.processStream(r.Context(), upstreamResp.Body, capWriter, h.config.PlanVisibility)
 
-	var finalContent string
+	// Determine what the client sees as the final content.
+	finalContent := capWriter.String()
 
-	if !planDetected {
-		finalContent = capWriter.String()
-	} else {
-		// Execute Loom plan
-		planCtx, cancel := context.WithTimeout(r.Context(), h.config.PlanTimeout)
-		defer cancel()
-
-		results := collectStepResults(planCtx, h.loom, planText)
-
-		// Build second request
-		injector := &ResultInjector{
-			OriginalMessages: chatReq.Messages,
-			PrePlanText:      prePlanText,
-			Results:          results,
-			Model:            chatReq.Model,
-		}
-		secondReq := injector.BuildRequest()
-
-		secondResp, err := h.forwardToUpstream(r, secondReq)
-		if err != nil {
-			http.Error(w, "second LLM call failed: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer secondResp.Body.Close()
-
-		// Accumulate final response
-		var finalBuf strings.Builder
-		ParseSSEStream(secondResp.Body, func(data []byte) error { //nolint:errcheck
-			if content, ok := ChunkContent(data); ok {
-				finalBuf.WriteString(content)
-			}
-			return nil
-		})
-		finalContent = finalBuf.String()
+	// === EGRESS: Launch background execution if plan detected. ===
+	if planText != "" {
+		h.logger.Debug("plan detected (non-streaming), launching background execution", "session", sessionID)
+		h.executeInBackground(sessionID, planText, assistantText)
 	}
 
-	// Assemble JSON response
+	// Assemble JSON response.
 	type respMessage struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
@@ -298,6 +268,155 @@ func (h *Handler) handleNonStreamingRequest(w http.ResponseWriter, r *http.Reque
 	w.Write(data) //nolint:errcheck
 }
 
+// processStream reads the upstream SSE body, forwards content to sw per visibility config,
+// and returns (planText, fullAssistantText). If no plan was detected, both are empty.
+//
+// v2 simplification: no mid-stream stop, no ActionPlanComplete. Plan completion
+// is determined after [DONE] via detector.HasPlan().
+func (h *Handler) processStream(ctx context.Context, body io.Reader, sw sseWriterIface, visibility TeeMode) (planText, fullAssistantText string) {
+	detector := &PlanDetector{}
+	// lastBufLen tracks how many bytes of partial-line content we've sent to the
+	// client via ActionBuffer, so ActionForward can send only the remaining delta.
+	var lastBufLen int
+
+	err := ParseSSEStream(body, func(data []byte) error {
+		content, ok := ChunkContent(data)
+		if !ok {
+			// Non-content chunk (role delta, etc.) — forward unless in plan context.
+			if !detector.HasPlan() || visibility == TeeModePassthrough {
+				return sw.WriteChunk(data)
+			}
+			return nil
+		}
+
+		actions := detector.Feed(content)
+		for _, act := range actions {
+			switch act.Type {
+			case ActionForward:
+				// Complete line in StateIdle — adjust for any partial already sent.
+				if lastBufLen > 0 {
+					// The first lastBufLen bytes were already forwarded via ActionBuffer.
+					if len(act.Content) > lastBufLen {
+						remaining := act.Content[lastBufLen:]
+						if err := sw.WriteContent(remaining); err != nil {
+							return err
+						}
+					}
+					lastBufLen = 0
+				} else {
+					if err := sw.WriteContent(act.Content); err != nil {
+						return err
+					}
+				}
+			case ActionBuffer:
+				// Partial line in StateIdle — forward only the new delta.
+				if !detector.HasPlan() {
+					delta := act.Content
+					if lastBufLen > 0 && len(act.Content) > lastBufLen {
+						delta = act.Content[lastBufLen:]
+					} else if lastBufLen > 0 {
+						delta = ""
+					}
+					lastBufLen = len(act.Content)
+					if delta != "" {
+						if err := sw.WriteContent(delta); err != nil {
+							return err
+						}
+					}
+				}
+			case ActionSuppress:
+				// Plan content — suppress unless passthrough mode.
+				if visibility == TeeModePassthrough {
+					if err := sw.WriteContent(act.Content); err != nil {
+						return err
+					}
+				}
+				// Reset lastBufLen since we've transitioned out of idle.
+				if lastBufLen > 0 {
+					lastBufLen = 0
+				}
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		h.logger.Error("SSE stream error", "err", err)
+	}
+
+	if !detector.HasPlan() {
+		return "", ""
+	}
+
+	return detector.PlanText(), detector.PrePlanText() + detector.PlanText()
+}
+
+// resolveSessionID determines the session ID for this request.
+// Priority: X-Loom-Session-ID header > derived from messages prefix.
+func (h *Handler) resolveSessionID(r *http.Request, messages []Message) string {
+	if id := r.Header.Get("X-Loom-Session-ID"); id != "" {
+		return id
+	}
+	return DeriveSessionID(messages)
+}
+
+// waitForPendingExecution blocks until any in-flight background execution for
+// the session completes, or the context is cancelled.
+func (h *Handler) waitForPendingExecution(ctx context.Context, session *SessionState) error {
+	session.Mu.Lock()
+	done := session.ExecutionDone
+	session.Mu.Unlock()
+
+	if done == nil {
+		return nil
+	}
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("timed out waiting for pending plan execution: %w", ctx.Err())
+	}
+}
+
+// executeInBackground stores the execution channel in the session and launches
+// a goroutine to execute the plan. Results are written to session.PendingResults
+// when execution completes.
+func (h *Handler) executeInBackground(sessionID, planText, assistantText string) {
+	session := h.sessions.GetOrCreate(sessionID)
+	done := make(chan struct{})
+
+	session.Mu.Lock()
+	session.ExecutionDone = done
+	session.LastAssistantMessage = assistantText
+	session.Mu.Unlock()
+
+	go func() {
+		defer close(done)
+
+		ctx, cancel := context.WithTimeout(context.Background(), h.config.Timeout)
+		defer cancel()
+
+		results := collectStepResults(ctx, h.loom, planText)
+
+		session.Mu.Lock()
+		session.PendingResults = results
+		session.Mu.Unlock()
+
+		h.logger.Debug("background execution complete", "session", sessionID, "steps", len(results))
+	}()
+}
+
+// collectStepResults drains a loom.Stream channel and returns all step results.
+func collectStepResults(ctx context.Context, l *loom.Loom, planText string) []dag.StepResult {
+	ch := l.Stream(ctx, strings.NewReader(planText))
+	var results []dag.StepResult
+	for sr := range ch {
+		results = append(results, sr)
+	}
+	return results
+}
+
 // capturingSSEWriter captures all WriteContent calls (for non-streaming accumulation).
 type capturingSSEWriter struct {
 	buf strings.Builder
@@ -315,151 +434,6 @@ type sseWriterIface interface {
 	WriteDone() error
 }
 
-// processFirstStream processes the upstream SSE stream, forwarding tokens per visibility config.
-// Returns (planText, prePlanText, planDetected).
-func (h *Handler) processFirstStream(ctx context.Context, body io.Reader, sw *SSEWriter, chatReq ChatCompletionRequest) (string, string, bool) {
-	return h.processFirstStreamCore(ctx, body, sw, chatReq)
-}
-
-// processFirstStreamCore is the core SSE processing logic. Uses sw to forward content.
-// Returns (planText, prePlanText, planDetected).
-// Note: prePlanText is only populated when a plan is detected (for pre-plan assistant message).
-func (h *Handler) processFirstStreamCore(ctx context.Context, body io.Reader, sw sseWriterIface, chatReq ChatCompletionRequest) (string, string, bool) {
-	var (
-		prePlanText     strings.Builder
-		lastBufLen      int // tracks how many bytes of prePlanText have been added for ActionBuffer
-		planDetector    = &PlanDetector{}
-		planDone        bool
-	)
-
-	cfg := h.config
-
-	err := ParseSSEStream(body, func(data []byte) error {
-		content, ok := ChunkContent(data)
-		if !ok {
-			// Non-content chunk (e.g., role delta) — forward raw unless plan active
-			if planDetector.State() == StateIdle || cfg.PlanVisibility == TeeModePassthrough {
-				return sw.WriteChunk(data)
-			}
-			return nil
-		}
-
-		actions := planDetector.Feed(content)
-		for _, act := range actions {
-			switch act.Type {
-			case ActionForward:
-				if planDetector.State() == StateIdle {
-					// Trim any buffered content already in prePlanText for this line.
-					// On ActionForward, act.Content includes the whole line (with newline).
-					// We need to avoid double-counting if ActionBuffer was emitted before.
-					if lastBufLen > 0 {
-						// The ActionBuffer already wrote partial content; reset counter.
-						// The completed line ActionForward already includes that partial content.
-						// Since prePlanText was written via ActionBuffer, and now we get the full
-						// line via ActionForward, we need to undo the partial write and rewrite.
-						// Simplest: trim the last lastBufLen bytes and re-append.
-						cur := prePlanText.String()
-						if len(cur) >= lastBufLen {
-							prePlanText.Reset()
-							prePlanText.WriteString(cur[:len(cur)-lastBufLen])
-						}
-						lastBufLen = 0
-					}
-					prePlanText.WriteString(act.Content)
-				}
-				// Forward in passthrough mode, or when we're still in idle
-				if cfg.PlanVisibility == TeeModePassthrough || planDetector.State() == StateIdle {
-					if err := sw.WriteContent(act.Content); err != nil {
-						return err
-					}
-				}
-			case ActionBuffer:
-				// Partial line in idle — forward tentatively. act.Content = FULL lineBuf.
-				// We track how much we've already added to avoid double-counting.
-				if planDetector.State() == StateIdle {
-					cur := prePlanText.String()
-					// Remove old buffer portion, add new full buffer
-					if lastBufLen > 0 && len(cur) >= lastBufLen {
-						prePlanText.Reset()
-						prePlanText.WriteString(cur[:len(cur)-lastBufLen])
-					}
-					// Incremental content = new full buf - old buf (in the SSEWriter sense)
-					// But since we're tracking via sw, just write the new character(s).
-					// act.Content is the full lineBuf; compute delta
-					delta := act.Content
-					if lastBufLen > 0 && len(act.Content) > lastBufLen {
-						delta = act.Content[lastBufLen:]
-					} else if lastBufLen > 0 {
-						// Buffer didn't grow (shouldn't happen normally)
-						delta = ""
-					}
-					prePlanText.WriteString(act.Content)
-					lastBufLen = len(act.Content)
-					if delta != "" {
-						if err := sw.WriteContent(delta); err != nil {
-							return err
-						}
-					}
-				} else if cfg.PlanVisibility == TeeModePassthrough {
-					if err := sw.WriteContent(act.Content); err != nil {
-						return err
-					}
-				}
-			case ActionSuppress:
-				if cfg.PlanVisibility == TeeModePassthrough {
-					if err := sw.WriteContent(act.Content); err != nil {
-						return err
-					}
-				}
-				// else: suppress
-			case ActionFlush:
-				if lastBufLen > 0 {
-					// Flush: the buffer turned out not to be a fence — act.Content
-					// includes the full flushed content. We already forwarded it
-					// incrementally via ActionBuffer, so no additional write needed.
-					// But prePlanText already has it. Reset lastBufLen.
-					lastBufLen = 0
-				} else {
-					prePlanText.WriteString(act.Content)
-					if cfg.PlanVisibility == TeeModePassthrough || planDetector.State() == StateIdle {
-						if err := sw.WriteContent(act.Content); err != nil {
-							return err
-						}
-					}
-				}
-			case ActionPlanComplete:
-				lastBufLen = 0
-				planDone = true
-				if cfg.PlanVisibility == TeeModeIndicator {
-					sw.WriteContent(cfg.IndicatorText) //nolint:errcheck
-				}
-				return errStopSSE
-			}
-		}
-		return nil
-	})
-
-	if err != nil && !errors.Is(err, errStopSSE) {
-		h.logger.Error("SSE stream error", "err", err)
-	}
-
-	if !planDone {
-		return "", prePlanText.String(), false
-	}
-
-	return planDetector.PlanText(), prePlanText.String(), true
-}
-
-// collectStepResults drains a loom.Stream channel and returns all step results.
-func collectStepResults(ctx context.Context, l *loom.Loom, planText string) []dag.StepResult {
-	ch := l.Stream(ctx, strings.NewReader(planText))
-	var results []dag.StepResult
-	for sr := range ch {
-		results = append(results, sr)
-	}
-	return results
-}
-
 // forwardToUpstream sends a ChatCompletionRequest to the upstream LLM and returns the response.
 func (h *Handler) forwardToUpstream(r *http.Request, chatReq ChatCompletionRequest) (*http.Response, error) {
 	data, err := json.Marshal(chatReq)
@@ -473,7 +447,6 @@ func (h *Handler) forwardToUpstream(r *http.Request, chatReq ChatCompletionReque
 		return nil, err
 	}
 
-	// Copy relevant headers from original request
 	req.Header.Set("Content-Type", "application/json")
 	if auth := r.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
@@ -482,7 +455,7 @@ func (h *Handler) forwardToUpstream(r *http.Request, chatReq ChatCompletionReque
 		req.Header.Set("Accept", accept)
 	}
 
-	// Auth override
+	// Auth override.
 	if h.config.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+h.config.APIKey)
 	}
@@ -490,7 +463,7 @@ func (h *Handler) forwardToUpstream(r *http.Request, chatReq ChatCompletionReque
 	return h.httpClient.Do(req)
 }
 
-// proxyPassthrough forwards a request to targetURL and relays the response back unchanged.
+// proxyPassthrough forwards a request to targetURL and relays the response unchanged.
 func (h *Handler) proxyPassthrough(w http.ResponseWriter, r *http.Request, targetURL string) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -504,14 +477,12 @@ func (h *Handler) proxyPassthrough(w http.ResponseWriter, r *http.Request, targe
 		return
 	}
 
-	// Copy headers
 	for key, values := range r.Header {
 		for _, v := range values {
 			req.Header.Add(key, v)
 		}
 	}
 
-	// Auth forwarding
 	if h.config.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+h.config.APIKey)
 	}
@@ -523,7 +494,6 @@ func (h *Handler) proxyPassthrough(w http.ResponseWriter, r *http.Request, targe
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
 	for key, values := range resp.Header {
 		for _, v := range values {
 			w.Header().Add(key, v)
@@ -554,7 +524,6 @@ func injectSystemPrompt(messages []Message, prompt, mode string) []Message {
 		mode = "prepend"
 	}
 
-	// Find existing system message index
 	sysIdx := -1
 	for i, m := range messages {
 		if m.Role == "system" {
@@ -584,16 +553,4 @@ func injectSystemPrompt(messages []Message, prompt, mode string) []Message {
 		}
 	}
 	return messages
-}
-
-// isStreamingRequest checks if the request body contains "stream":true.
-// Kept for backwards compatibility / reference.
-func isStreamingRequest(body []byte) bool {
-	var req struct {
-		Stream *bool `json:"stream"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return false
-	}
-	return req.Stream != nil && *req.Stream
 }
