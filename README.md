@@ -127,18 +127,23 @@ A user asks "Compare pricing for product X across 5 vendors." The LLM emits 5 pa
 `io` fetches that all execute simultaneously. Serial tool calling would take 5 × LLM round
 trips; Loom does it in one.
 
-```
+````
 ```io vendor_a
 GET https://api.vendor-a.com/price?sku=X
 ```
+
 ```io vendor_b
 GET https://api.vendor-b.com/price?sku=X
 ```
-...
-```pure(vendor_a,vendor_b,...) compare
-cheapest = min(vendor_a, vendor_b, ...)
+
+```io vendor_c
+GET https://api.vendor-c.com/price?sku=X
 ```
+
+```pure(vendor_a, vendor_b, vendor_c) compare
+cheapest = min(vendor_a, vendor_b, vendor_c)
 ```
+````
 
 ### 2. Data Pipeline (multi-stage DAG)
 
@@ -185,14 +190,15 @@ identical concurrent requests are additionally coalesced by singleflight.
 
 ### 6. Code Generation + Execution
 
-```
+````
 ```pure sandbox
 js: fetch("https://jsonplaceholder.typicode.com/todos/1").then(r=>r.json())
 ```
+
 ```shell(sandbox) run
 node -e "${sandbox}"
 ```
-```
+````
 
 The `shell` step runs in a WASM sandbox with no host capabilities by default.
 
